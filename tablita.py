@@ -135,25 +135,30 @@ class AffineCalibrator(nn.Module):
 
 def generate_synthetic_data(N=1000, n_classes=4, n_subjects=10, 
                            ground_truth_config='a_subject_b_global',
-                           ground_truth_transform='a*(logits+b)'):
+                           ground_truth_transform='a*(logits+b)',
+                           noise_level=0.1, seed=42):
     """Generate synthetic data with known ground truth"""
+    np.random.seed(seed)
     
-    # Set ground truth parameters
+    # Set ground truth parameters with more variety
     if ground_truth_config == 'a_global_b_global':
         true_a = np.ones(n_subjects) * 1.2
         true_b = np.tile(np.array([3.0, 2.0, 1.0, 0.0]), (n_subjects, 1))
     elif ground_truth_config == 'a_subject_b_global':
-        true_a = np.random.uniform(0.8, 1.5, n_subjects)
-        true_b = np.tile(np.array([3.0, 2.0, 1.0, 0.0]), (n_subjects, 1))
+        # Make sure we have real variation
+        true_a = np.random.uniform(0.5, 2.0, n_subjects)  # Wider range
+        true_b = np.tile(np.array([2.5, 1.5, 0.5, 0.0]), (n_subjects, 1))
     else:  # a_subject_b_subject
-        true_a = np.random.uniform(0.8, 1.5, n_subjects)
-        true_b = np.random.uniform(-1, 3, (n_subjects, n_classes))
+        true_a = np.random.uniform(0.5, 2.0, n_subjects)
+        true_b = np.random.uniform(-2, 3, (n_subjects, n_classes))
+        # Ensure one class has b=0 for identifiability
+        true_b[:, -1] = 0
     
     print(f"Ground truth: {ground_truth_config} - {ground_truth_transform}")
-    print(f"True a: mean={np.mean(true_a):.3f}, std={np.std(true_a):.3f}")
-    print(f"True b: mean={np.mean(true_b, axis=0)}")
+    print(f"True a: mean={np.mean(true_a):.3f}, std={np.std(true_a):.3f}, range=[{np.min(true_a):.3f}, {np.max(true_a):.3f}]")
+    print(f"True b: mean={np.mean(true_b, axis=0)}, std={np.std(true_b, axis=0):.3f}")
     
-    # Generate data
+    # Generate data with realistic structure
     X_logits = []
     y_labels = []
     subject_indices = []
@@ -163,30 +168,44 @@ def generate_synthetic_data(N=1000, n_classes=4, n_subjects=10,
         subj = np.random.randint(0, n_subjects)
         y = np.random.randint(0, n_classes)
         
-        # Generate signal
-        signal = np.random.randn(n_classes) * 2
-        signal[y] += np.random.normal(5, 2)  # Add info to correct answer
+        # Generate more realistic logits - some signal, some noise
+        base_logits = np.random.randn(n_classes) * 1.0  # Base noise
         
-        # Apply inverse calibration to get raw logits
+        # Add signal to correct answer (variable strength)
+        signal_strength = np.random.uniform(1.0, 4.0)
+        base_logits[y] += signal_strength
+        
+        # Add some confusing signal to other options
+        for j in range(n_classes):
+            if j != y and np.random.rand() < 0.3:  # 30% chance of confusing signal
+                base_logits[j] += np.random.uniform(0.5, 2.0)
+        
+        # Apply inverse calibration to get what the model would have output
         a = true_a[subj]
         b = true_b[subj]
         
         if ground_truth_transform == 'a*(logits+b)':
-            # signal = a * (logits + b)
-            # logits = signal/a - b
-            logits = signal / a - b
+            # calibrated = a * (logits + b)
+            # logits = calibrated/a - b
+            calibrated_logits = base_logits  # This is what we want after calibration
+            raw_logits = calibrated_logits / a - b
         else:  # a*logits+b
-            # signal = a * logits + b
-            # logits = (signal - b) / a
-            logits = (signal - b) / a
+            # calibrated = a * logits + b
+            # logits = (calibrated - b) / a
+            calibrated_logits = base_logits
+            raw_logits = (calibrated_logits - b) / a
         
-        X_logits.append(logits)
+        # Add noise to raw logits (imperfect model)
+        raw_logits += np.random.randn(n_classes) * noise_level
+        
+        X_logits.append(raw_logits)
         y_labels.append(y)
         subject_indices.append(subj)
     
     return (np.array(X_logits, dtype=np.float32), 
             np.array(y_labels, dtype=np.int64), 
-            np.array(subject_indices, dtype=np.int64))
+            np.array(subject_indices, dtype=np.int64),
+            {'true_a': true_a, 'true_b': true_b})
 
 
 def compute_metrics(probs, targets):
@@ -204,7 +223,7 @@ def compute_metrics(probs, targets):
 
 
 def run_experiment(train_data, eval_data, config_name, transform, n_subjects):
-    """Run one calibration experiment"""
+    """Enhanced run_experiment with better optimization"""
     train_logits, train_targets, train_subjects = train_data
     eval_logits, eval_targets, eval_subjects = eval_data
     
@@ -213,31 +232,45 @@ def run_experiment(train_data, eval_data, config_name, transform, n_subjects):
     share_b = 'b_global' in config_name
     shift_then_scale = (transform == 'a*(logits+b)')
     
-    # Create and fit model
-    model = AffineCalibrator(
-        n_classes=4,
-        n_subjects=n_subjects,
-        share_a=share_a,
-        share_b=share_b,
+    # Try multiple learning rates and take the best
+    best_loss = float('inf')
+    best_model_state = None
+    
+    for lr in [0.1, 0.5, 1.0, 2.0]:
+        model = AffineCalibrator(
+            n_classes=4, n_subjects=n_subjects,
+            share_a=share_a, share_b=share_b,
+            shift_then_scale=shift_then_scale
+        )
+        
+        final_loss = model.fit(
+            train_logits, train_targets, train_subjects,
+            lr=lr, max_iter=10000, tolerance=1e-16, verbose=False
+        )
+        
+        if final_loss < best_loss:
+            best_loss = final_loss
+            best_model_state = model.state_dict()
+    
+    # Create final model with best parameters
+    final_model = AffineCalibrator(
+        n_classes=4, n_subjects=n_subjects,
+        share_a=share_a, share_b=share_b,
         shift_then_scale=shift_then_scale
     )
-    
-    final_loss = model.fit(
-        train_logits, train_targets, train_subjects,
-        lr=1.0, max_iter=5000, tolerance=1e-15, verbose=False
-    )
+    final_model.load_state_dict(best_model_state)
     
     # Evaluate
-    train_probs = model.predict_proba(train_logits, train_subjects)
-    eval_probs = model.predict_proba(eval_logits, eval_subjects)
+    train_probs = final_model.predict_proba(train_logits, train_subjects)
+    eval_probs = final_model.predict_proba(eval_logits, eval_subjects)
     
     train_metrics = compute_metrics(train_probs, train_targets)
     eval_metrics = compute_metrics(eval_probs, eval_targets)
     
     # Get parameters
     with torch.no_grad():
-        a_vals = torch.exp(model.log_a).cpu().numpy()
-        b_vals = model.bias.cpu().numpy()
+        a_vals = torch.exp(final_model.log_a).cpu().numpy()
+        b_vals = final_model.bias.cpu().numpy()
     
     result = {
         'config': config_name,
@@ -246,8 +279,8 @@ def run_experiment(train_data, eval_data, config_name, transform, n_subjects):
         'train_nce': train_metrics['nce'],
         'eval_acc': eval_metrics['accuracy'],
         'eval_nce': eval_metrics['nce'],
-        'final_loss': final_loss,
-        'n_params': sum(p.numel() for p in model.parameters()),
+        'final_loss': best_loss,
+        'n_params': sum(p.numel() for p in final_model.parameters()),
         'a_mean': np.mean(a_vals),
         'a_std': np.std(a_vals) if len(a_vals) > 1 else 0,
         'b_mean': np.mean(b_vals)
@@ -256,10 +289,181 @@ def run_experiment(train_data, eval_data, config_name, transform, n_subjects):
     return result
 
 
+def validate_synthetic_experiment():
+    """Comprehensive validation on synthetic data"""
+    print("\n" + "=" * 80)
+    print("COMPREHENSIVE SYNTHETIC DATA VALIDATION")
+    print("=" * 80)
+    
+    # Test different ground truth scenarios
+    test_scenarios = [
+        ('a_global_b_global', 'a*logits+b'),
+        ('a_global_b_global', 'a*(logits+b)'),
+        ('a_subject_b_global', 'a*logits+b'),
+        ('a_subject_b_global', 'a*(logits+b)'),
+        ('a_subject_b_subject', 'a*logits+b'),
+        ('a_subject_b_subject', 'a*(logits+b)'),
+    ]
+    
+    configs = [
+        ('a_global_b_global', 'a*logits+b'),
+        ('a_global_b_global', 'a*(logits+b)'),
+        ('a_subject_b_global', 'a*logits+b'),
+        ('a_subject_b_global', 'a*(logits+b)'),
+        ('a_subject_b_subject', 'a*logits+b'),
+        ('a_subject_b_subject', 'a*(logits+b)'),
+    ]
+    
+    validation_results = []
+    
+    for gt_config, gt_transform in test_scenarios:
+        print(f"\n{'='*60}")
+        print(f"GROUND TRUTH: {gt_config} - {gt_transform}")
+        print(f"{'='*60}")
+        
+        # Generate data
+        N = 8000  # Larger dataset
+        n_subjects = 15
+        
+        X_logits, y_labels, subject_indices, gt_params = generate_synthetic_data(
+            N=N, n_subjects=n_subjects,
+            ground_truth_config=gt_config,
+            ground_truth_transform=gt_transform,
+            noise_level=0.05,  # Lower noise for cleaner signal
+            seed=42
+        )
+        
+        # Split data
+        split = int(0.8 * N)
+        train_data = (X_logits[:split], y_labels[:split], subject_indices[:split])
+        eval_data = (X_logits[split:], y_labels[split:], subject_indices[split:])
+        
+        # Baseline performance
+        eval_probs_uncal = softmax(eval_data[0], axis=1)
+        baseline_metrics = compute_metrics(eval_probs_uncal, eval_data[1])
+        print(f"Uncalibrated - Accuracy: {baseline_metrics['accuracy']:.4f}, NCE: {baseline_metrics['nce']:.4f}")
+        
+        # Test all configurations
+        scenario_results = []
+        best_nce = float('inf')
+        best_config = None
+        
+        for config_name, transform in configs:
+            print(f"  Testing {config_name} - {transform}... ", end='')
+            
+            # Multiple random initializations to ensure we find global optimum
+            best_loss = float('inf')
+            best_result = None
+            
+            for seed in range(5):  # Try 5 different initializations
+                torch.manual_seed(seed)
+                np.random.seed(seed)
+                
+                result = run_experiment(train_data, eval_data, config_name, transform, n_subjects)
+                if result['final_loss'] < best_loss:
+                    best_loss = result['final_loss']
+                    best_result = result
+            
+            scenario_results.append(best_result)
+            
+            # Track overall best
+            if best_result['eval_nce'] < best_nce:
+                best_nce = best_result['eval_nce']
+                best_config = (config_name, transform)
+            
+            print(f"NCE: {best_result['eval_nce']:.4f}")
+        
+        # Check if we recovered the correct configuration
+        correct_recovery = (best_config[0] == gt_config and best_config[1] == gt_transform)
+        
+        print(f"\nBest recovered: {best_config[0]} - {best_config[1]} (NCE: {best_nce:.4f})")
+        print(f"Correct recovery: {'✓' if correct_recovery else '✗'}")
+        
+        # Parameter recovery analysis for the correct model
+        if correct_recovery:
+            correct_result = [r for r in scenario_results 
+                            if r['config'] == gt_config and r['transform'] == gt_transform][0]
+            
+            # Get fitted parameters
+            share_a = 'a_global' in gt_config
+            share_b = 'b_global' in gt_config
+            shift_then_scale = (gt_transform == 'a*(logits+b)')
+            
+            model = AffineCalibrator(
+                n_classes=4, n_subjects=n_subjects,
+                share_a=share_a, share_b=share_b,
+                shift_then_scale=shift_then_scale
+            )
+            model.fit(train_data[0], train_data[1], train_data[2], verbose=False)
+            
+            with torch.no_grad():
+                fitted_a = torch.exp(model.log_a).cpu().numpy()
+                fitted_b = model.bias.cpu().numpy()
+            
+            # Compare with ground truth
+            true_a = gt_params['true_a']
+            true_b = gt_params['true_b']
+            
+            if share_a:
+                a_error = abs(fitted_a[0] - np.mean(true_a))
+                print(f"Scale parameter - True: {np.mean(true_a):.3f}, Fitted: {fitted_a[0]:.3f}, Error: {a_error:.3f}")
+            else:
+                a_errors = np.abs(fitted_a - true_a)
+                print(f"Scale parameters - Mean error: {np.mean(a_errors):.3f}, Max error: {np.max(a_errors):.3f}")
+            
+            if share_b:
+                b_errors = np.abs(fitted_b - true_b[0])
+                print(f"Bias parameters - Mean error: {np.mean(b_errors):.3f}, Max error: {np.max(b_errors):.3f}")
+            else:
+                b_errors = np.abs(fitted_b - true_b)
+                print(f"Bias parameters - Mean error: {np.mean(b_errors):.3f}, Max error: {np.max(b_errors):.3f}")
+        
+        # Store results
+        validation_results.append({
+            'gt_config': gt_config,
+            'gt_transform': gt_transform,
+            'best_config': best_config[0],
+            'best_transform': best_config[1],
+            'best_nce': best_nce,
+            'correct_recovery': correct_recovery,
+            'baseline_nce': baseline_metrics['nce'],
+            'improvement': baseline_metrics['nce'] - best_nce
+        })
+    
+    # Summary
+    print(f"\n{'='*80}")
+    print("VALIDATION SUMMARY")
+    print(f"{'='*80}")
+    
+    validation_df = pd.DataFrame(validation_results)
+    
+    print("Configuration Recovery Results:")
+    print("-" * 50)
+    for _, row in validation_df.iterrows():
+        status = "✓" if row['correct_recovery'] else "✗"
+        print(f"{status} {row['gt_config']:20s} {row['gt_transform']:15s} -> "
+              f"{row['best_config']:20s} {row['best_transform']:15s} "
+              f"(NCE: {row['best_nce']:.4f}, Δ: {row['improvement']:.4f})")
+    
+    recovery_rate = validation_df['correct_recovery'].mean()
+    avg_improvement = validation_df['improvement'].mean()
+    
+    print(f"\nOverall Recovery Rate: {recovery_rate:.1%}")
+    print(f"Average NCE Improvement: {avg_improvement:.4f}")
+    
+    if recovery_rate < 0.8:
+        print("\n⚠️  WARNING: Low recovery rate suggests optimization issues!")
+        print("   Consider: longer training, better initialization, or different optimizer")
+    else:
+        print("\n✓ Good recovery rate - optimization appears reliable")
+    
+    return validation_df
+
+
 def main():
     """Main experiment"""
     print("=" * 80)
-    print("MMLU Calibration Analysis - Clean Implementation")
+    print("MMLU Calibration Analysis - Enhanced with Comprehensive Validation")
     print("=" * 80)
     
     # Configurations to test
@@ -272,20 +476,25 @@ def main():
         ('a_subject_b_subject', 'a*(logits+b)'),
     ]
     
-    # Test on synthetic data
-    print("\nSYNTHETIC DATA EXPERIMENT")
-    print("-" * 60)
+    # Comprehensive synthetic validation
+    validation_df = validate_synthetic_experiment()
+    
+    # Quick demonstration with one scenario
+    print("\n" + "=" * 60)
+    print("QUICK DEMONSTRATION")
+    print("=" * 60)
     
     # Generate data with known ground truth
-    N = 5000
-    n_subjects = 10
+    N = 3000
+    n_subjects = 8
     ground_truth_config = 'a_subject_b_global'
     ground_truth_transform = 'a*(logits+b)'
     
-    X_logits, y_labels, subject_indices = generate_synthetic_data(
+    X_logits, y_labels, subject_indices, gt_params = generate_synthetic_data(
         N=N, n_subjects=n_subjects,
         ground_truth_config=ground_truth_config,
-        ground_truth_transform=ground_truth_transform
+        ground_truth_transform=ground_truth_transform,
+        noise_level=0.1
     )
     
     # Split data
@@ -312,7 +521,7 @@ def main():
     results_df = pd.DataFrame(results)
     
     print("\n" + "=" * 80)
-    print("RESULTS SUMMARY")
+    print("QUICK DEMO RESULTS")
     print("=" * 80)
     
     # Create comparison table
@@ -327,10 +536,6 @@ def main():
     print("-" * 60)
     print(pivot['eval_nce'].round(4))
     
-    print("\nTraining NCE (lower is better):")
-    print("-" * 60)
-    print(pivot['train_nce'].round(4))
-    
     print("\nEvaluation Accuracy:")
     print("-" * 60)
     print(pivot['eval_acc'].round(4))
@@ -339,6 +544,10 @@ def main():
     print(f"\nGround truth was: {ground_truth_config} - {ground_truth_transform}")
     best_config = results_df.loc[results_df['eval_nce'].idxmin()]
     print(f"Best config: {best_config['config']} - {best_config['transform']} (NCE={best_config['eval_nce']:.4f})")
+    
+    correct_identification = (best_config['config'] == ground_truth_config and 
+                            best_config['transform'] == ground_truth_transform)
+    print(f"Correctly identified: {'✓' if correct_identification else '✗'}")
     
     # Parameter details
     print("\nParameter counts and convergence:")
@@ -354,38 +563,89 @@ def main():
     print("=" * 80)
     
     try:
-        # Load MMLU data
+        # Load MMLU data - check current directory and common paths
         files = glob.glob("mmlu_logits_*.csv")
         if not files:
+            files = glob.glob("*.csv")  # Fallback to any CSV
+            files = [f for f in files if "mmlu_logits" in f]
+        
+        if not files:
             print("No MMLU data files found. Skipping MMLU experiment.")
+            print("Expected files like: mmlu_logits_model_name_split.csv")
             return
+        
+        print(f"Found {len(files)} MMLU files:")
+        for f in files:
+            print(f"  {f}")
         
         # Group by model and split
         data_by_model = {}
         for file in files:
-            df = pd.read_csv(file)
-            
-            # Extract model and split from filename
-            basename = os.path.basename(file)
-            parts = basename.replace('mmlu_logits_', '').replace('.csv', '').split('_')
-            split = parts[-1]
-            model = '_'.join(parts[:-1])
-            
-            if model not in data_by_model:
-                data_by_model[model] = {}
-            data_by_model[model][split] = df
+            try:
+                df = pd.read_csv(file)
+                print(f"Loading {file}: {len(df)} rows")
+                
+                # Extract model and split from filename
+                basename = os.path.basename(file)
+                parts = basename.replace('mmlu_logits_', '').replace('.csv', '').split('_')
+                split = parts[-1]
+                model = '_'.join(parts[:-1])
+                
+                # Validate expected columns
+                required_cols = ['logit_A', 'logit_B', 'logit_C', 'logit_D', 'correct_answer_position', 'subject']
+                missing_cols = [col for col in required_cols if col not in df.columns]
+                if missing_cols:
+                    print(f"  Warning: Missing columns in {file}: {missing_cols}")
+                    continue
+                
+                if model not in data_by_model:
+                    data_by_model[model] = {}
+                data_by_model[model][split] = df
+                
+            except Exception as e:
+                print(f"  Error loading {file}: {e}")
+                continue
+        
+        if not data_by_model:
+            print("No valid MMLU data could be loaded.")
+            return
         
         # Process each model
         for model_name, splits in data_by_model.items():
-            if 'test' not in splits or 'validation' not in splits:
-                continue
-                
             print(f"\nModel: {model_name}")
+            print(f"Available splits: {list(splits.keys())}")
+            
+            # Use test for training, validation for evaluation (MMLU convention)
+            train_split = None
+            eval_split = None
+            
+            if 'test' in splits and 'validation' in splits:
+                train_split = 'test'
+                eval_split = 'validation'
+            elif 'test' in splits and 'dev' in splits:
+                train_split = 'test'
+                eval_split = 'dev'
+            elif len(splits) >= 2:
+                # Use whatever two splits we have
+                split_names = list(splits.keys())
+                train_split = split_names[0]
+                eval_split = split_names[1]
+                print(f"Using {train_split} for training, {eval_split} for evaluation")
+            else:
+                print(f"  Skipping {model_name}: need at least 2 splits for train/eval")
+                continue
+            
             print("-" * 40)
             
             # Prepare data
             def prepare_data(df):
-                logits = df[['logit_A', 'logit_B', 'logit_C', 'logit_D']].values.astype(np.float32)
+                # Check for NaN values in logits
+                logit_cols = ['logit_A', 'logit_B', 'logit_C', 'logit_D']
+                if df[logit_cols].isna().any().any():
+                    print(f"  Warning: Found NaN values in logits, dropping rows")
+                    df = df.dropna(subset=logit_cols)
+                
+                logits = df[logit_cols].values.astype(np.float32)
                 targets = df['correct_answer_position'].values.astype(np.int64)
                 
                 # Map subjects to indices
@@ -395,10 +655,10 @@ def main():
                 
                 return logits, targets, subj_indices, len(subjects)
             
-            train_logits, train_targets, train_subjects, n_subjects = prepare_data(splits['test'])
-            eval_logits, eval_targets, eval_subjects, _ = prepare_data(splits['validation'])
+            train_logits, train_targets, train_subjects, n_subjects = prepare_data(splits[train_split])
+            eval_logits, eval_targets, eval_subjects, _ = prepare_data(splits[eval_split])
             
-            print(f"Train: {len(train_logits)}, Eval: {len(eval_logits)}, Subjects: {n_subjects}")
+            print(f"Train ({train_split}): {len(train_logits)}, Eval ({eval_split}): {len(eval_logits)}, Subjects: {n_subjects}")
             
             # Baseline
             eval_probs_uncal = softmax(eval_logits, axis=1)
@@ -408,6 +668,7 @@ def main():
             # Run experiments
             mmlu_results = []
             for config_name, transform in configs:
+                print(f"  Running {config_name} - {transform}")
                 result = run_experiment(
                     (train_logits, train_targets, train_subjects),
                     (eval_logits, eval_targets, eval_subjects),
@@ -427,8 +688,15 @@ def main():
             print("\nCalibrated NCE:")
             print(pivot.round(4))
             
+            # Show best result
+            best_idx = mmlu_df['eval_nce'].idxmin()
+            best = mmlu_df.iloc[best_idx]
+            print(f"Best: {best['config']} - {best['transform']} (NCE: {best['eval_nce']:.4f})")
+            
     except Exception as e:
         print(f"Error processing MMLU data: {e}")
+        import traceback
+        traceback.print_exc()
     
     print("\nExperiment complete!")
 
