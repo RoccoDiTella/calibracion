@@ -156,7 +156,11 @@ def generate_synthetic_data(N=1000, n_classes=4, n_subjects=10,
     
     print(f"Ground truth: {ground_truth_config} - {ground_truth_transform}")
     print(f"True a: mean={np.mean(true_a):.3f}, std={np.std(true_a):.3f}, range=[{np.min(true_a):.3f}, {np.max(true_a):.3f}]")
-    print(f"True b: mean={np.mean(true_b, axis=0)}, std={np.std(true_b, axis=0):.3f}")
+    
+    # Format the array values properly
+    b_means = np.mean(true_b, axis=0)
+    b_stds = np.std(true_b, axis=0)
+    print(f"True b: mean={[f'{x:.3f}' for x in b_means]}, std={np.mean(b_stds):.3f}")
     
     # Generate data with realistic structure
     X_logits = []
