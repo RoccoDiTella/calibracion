@@ -46,13 +46,57 @@ letter_ids = [tokenizer.convert_tokens_to_ids(letter) for letter in letters]
 # Model-specific cache file
 model_name_clean = model_id.replace("/", "_").replace("-", "_")
 cache_filename = f'forward_cache_{model_name_clean}.pkl'
-if os.path.exists(cache_filename):
-    with open(cache_filename, 'rb') as f:
-        cache = pickle.load(f)
-    print(f"Loaded cache with {len(cache)} entries from {cache_filename}")
-else:
+
+def save_cache_safely(cache, cache_filename):
+    """Save cache with backup to prevent corruption"""
+    temp_filename = cache_filename + '.tmp'
+    
+    # Save to temporary file first
+    with open(temp_filename, 'wb') as f:
+        pickle.dump(cache, f)
+    
+    # Only replace the original if temp save succeeded
+    if os.path.exists(cache_filename):
+        os.rename(cache_filename, cache_filename + '.bak')
+    os.rename(temp_filename, cache_filename)
+    
+    # Clean up backup after successful save
+    backup_file = cache_filename + '.bak'
+    if os.path.exists(backup_file):
+        os.remove(backup_file)
+
+def load_cache_safely(cache_filename):
+    """Load cache with fallback to backup if main file is corrupted"""
     cache = {}
+    
+    # Try loading main cache file
+    if os.path.exists(cache_filename):
+        try:
+            with open(cache_filename, 'rb') as f:
+                cache = pickle.load(f)
+            print(f"Loaded cache with {len(cache)} entries from {cache_filename}")
+            return cache
+        except (EOFError, pickle.UnpicklingError) as e:
+            print(f"Cache file corrupted: {e}")
+            
+            # Try backup file
+            backup_file = cache_filename + '.bak'
+            if os.path.exists(backup_file):
+                try:
+                    with open(backup_file, 'rb') as f:
+                        cache = pickle.load(f)
+                    print(f"Loaded cache from backup with {len(cache)} entries")
+                    return cache
+                except (EOFError, pickle.UnpicklingError):
+                    print("Backup cache also corrupted, starting fresh")
+            else:
+                print("No backup available, starting fresh")
+    
     print(f"Starting with empty cache (will save to {cache_filename})")
+    return cache
+
+# Load cache safely
+cache = load_cache_safely(cache_filename)
 
 def hash_string(s: str) -> str:
     """Hash a string for cache keys"""
@@ -84,8 +128,7 @@ def forward(prompt, nopts=4):
     
     # Save cache periodically (every 20 new entries)
     if len(cache) % 20 == 0:
-        with open(cache_filename, 'wb') as f:
-            pickle.dump(cache, f)
+        save_cache_safely(cache, cache_filename)
         print(f"Cache saved ({len(cache)} entries)")
     
     return scores
@@ -202,8 +245,7 @@ def process_mmlu_split(df, split_name, num_questions=None, random_sample=False):
             })
     
     # Save cache at the end
-    with open(cache_filename, 'wb') as f:
-        pickle.dump(cache, f)
+    save_cache_safely(cache, cache_filename)
     print(f"Cache saved after processing {split_name} ({len(cache)} entries)")
     
     # Create DataFrame and save
@@ -324,7 +366,7 @@ def main():
         split_results = process_mmlu_split(
             df, 
             split, 
-            num_questions=200,  # Test with 10 questions
+            num_questions=100,  # Test with 10 questions
             random_sample=False  # Random sample
         )
         if split_results is not None:
