@@ -231,7 +231,7 @@ def run_experiment():
     print("="*60)
     
     train_data, val_data, true_bias, topic_difficulties = generate_synthetic_data(
-        n_topics=5, n_questions_per_topic=100, n_options=4, train_split=0.7
+        n_topics=11, n_questions_per_topic=50, n_options=4, train_split=0.7
     )
     
     # Calculate uncalibrated performance
@@ -268,7 +268,7 @@ def run_experiment():
         linear_config = CalibrationConfig(
             shift_then_scale=False, share_a=shared_a, share_b=shared_b, device=device
         )
-        linear_calibrator = TorchCalibrator(linear_config, 5, 4)
+        linear_calibrator = TorchCalibrator(linear_config, 11, 4)
         linear_calibrator.fit(train_data['logits'], train_data['labels'], train_data['topics'])
         
         # Evaluate on both train and validation
@@ -284,7 +284,7 @@ def run_experiment():
         shift_config = CalibrationConfig(
             shift_then_scale=True, share_a=shared_a, share_b=shared_b, device=device
         )
-        shift_calibrator = TorchCalibrator(shift_config, 5, 4)
+        shift_calibrator = TorchCalibrator(shift_config, 11, 4)
         shift_calibrator.fit(train_data['logits'], train_data['labels'], train_data['topics'])
         
         # Evaluate on both train and validation
@@ -313,16 +313,28 @@ def run_experiment():
         print(f"    Train - Acc: {shift_train_acc:.4f}, NCE: {shift_train_nce:.4f}")
         print(f"    Val   - Acc: {shift_val_acc:.4f}, NCE: {shift_val_nce:.4f}")
     
-    # Create results table focused on validation NCE
+    # Create results tables for both train and validation
     print("\n" + "="*80)
-    print("FINAL RESULTS TABLE (Normalized Cross Entropy)")
+    print("TRAINING SET RESULTS (Normalized Cross Entropy)")
     print("="*80)
     
-    df = pd.DataFrame(results)
-    df_display = df[['Configuration', 'Uncalibrated_Val', 'Linear_Val', 'Shift_Val']].copy()
-    df_display.columns = ['Configuration', 'Uncalibrated', 'a*logit+b', 'a*(logit+b)']
+    df_train = pd.DataFrame(results)
+    df_train_display = df_train[['Configuration', 'Uncalibrated_Val', 'Linear_Train', 'Shift_Train']].copy()
+    df_train_display.columns = ['Configuration', 'Uncalibrated', 'a*logit+b', 'a*(logit+b)']
+    # Replace uncalibrated val with train for consistency
+    df_train_display['Uncalibrated'] = train_nce
     
-    print(df_display.to_string(index=False, float_format='%.4f'))
+    print(df_train_display.to_string(index=False, float_format='%.4f'))
+    
+    print("\n" + "="*80)
+    print("VALIDATION SET RESULTS (Normalized Cross Entropy)")
+    print("="*80)
+    
+    df_val = pd.DataFrame(results)
+    df_val_display = df_val[['Configuration', 'Uncalibrated_Val', 'Linear_Val', 'Shift_Val']].copy()
+    df_val_display.columns = ['Configuration', 'Uncalibrated', 'a*logit+b', 'a*(logit+b)']
+    
+    print(df_val_display.to_string(index=False, float_format='%.4f'))
     
     # Show parameter recovery for the most interesting case
     print("\n" + "="*60)
@@ -333,13 +345,13 @@ def run_experiment():
     linear_config = CalibrationConfig(
         shift_then_scale=False, share_a=False, share_b=True, device=device
     )
-    linear_calibrator = TorchCalibrator(linear_config, 5, 4)
+    linear_calibrator = TorchCalibrator(linear_config, 11, 4)
     linear_calibrator.fit(train_data['logits'], train_data['labels'], train_data['topics'])
     
     shift_config = CalibrationConfig(
         shift_then_scale=True, share_a=False, share_b=True, device=device
     )
-    shift_calibrator = TorchCalibrator(shift_config, 5, 4)
+    shift_calibrator = TorchCalibrator(shift_config, 11, 4)
     shift_calibrator.fit(train_data['logits'], train_data['labels'], train_data['topics'])
     
     print(f"True bias vector: {true_bias}")
@@ -393,7 +405,7 @@ def run_experiment():
     print("Key metric: Normalized Cross Entropy (NCE) = CrossEntropy / log(4)")
     print("Lower NCE indicates better calibration performance.")
     
-    return df_display, true_bias, topic_difficulties
+    return df_val_display, true_bias, topic_difficulties
 
 if __name__ == "__main__":
     results_df, true_bias, topic_difficulties = run_experiment()
