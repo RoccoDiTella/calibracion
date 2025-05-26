@@ -641,8 +641,14 @@ def main():
             
             print("-" * 40)
             
-            # Prepare data
-            def prepare_data(df):
+            # Create consistent subject mapping across both splits
+            all_subjects = sorted(set(splits[train_split]['subject'].unique()) | 
+                                set(splits[eval_split]['subject'].unique()))
+            subj_to_idx = {s: i for i, s in enumerate(all_subjects)}
+            n_subjects = len(all_subjects)
+            
+            # Prepare data with consistent subject mapping
+            def prepare_data(df, subj_to_idx):
                 # Check for NaN values in logits
                 logit_cols = ['logit_A', 'logit_B', 'logit_C', 'logit_D']
                 if df[logit_cols].isna().any().any():
@@ -652,15 +658,13 @@ def main():
                 logits = df[logit_cols].values.astype(np.float32)
                 targets = df['correct_answer_position'].values.astype(np.int64)
                 
-                # Map subjects to indices
-                subjects = sorted(df['subject'].unique())
-                subj_to_idx = {s: i for i, s in enumerate(subjects)}
+                # Use consistent subject mapping
                 subj_indices = df['subject'].map(subj_to_idx).values.astype(np.int64)
                 
-                return logits, targets, subj_indices, len(subjects)
+                return logits, targets, subj_indices
             
-            train_logits, train_targets, train_subjects, n_subjects = prepare_data(splits[train_split])
-            eval_logits, eval_targets, eval_subjects, _ = prepare_data(splits[eval_split])
+            train_logits, train_targets, train_subjects = prepare_data(splits[train_split], subj_to_idx)
+            eval_logits, eval_targets, eval_subjects = prepare_data(splits[eval_split], subj_to_idx)
             
             print(f"Train ({train_split}): {len(train_logits)}, Eval ({eval_split}): {len(eval_logits)}, Subjects: {n_subjects}")
             
