@@ -275,9 +275,9 @@ def create_verification_plots(df, filename):
     plt.tight_layout()
     
     # Save plot
-    plot_filename = filename.replace('.csv', '_verification.png')
-    plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
-    print(f"✅ Saved verification plots to: {plot_filename}")
+    # plot_filename = filename.replace('.csv', '_verification.png')
+    # plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
+    # print(f"✅ Saved verification plots to: {plot_filename}")
     plt.close()
 
 def main():
