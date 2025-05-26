@@ -17,8 +17,8 @@ if token:
     login(token=token)
 
 # Model selection - uncomment the one you want to use
-model_id = "meta-llama/Llama-3.2-1B-Instruct"  # 1B parameters (default)
-# model_id = "meta-llama/Llama-3.2-3B-Instruct"  # 3B parameters
+# model_id = "meta-llama/Llama-3.2-1B-Instruct"  # 1B parameters (default)
+model_id = "meta-llama/Llama-3.2-3B-Instruct"  # 3B parameters
 # model_id = "mistralai/Mistral-7B-Instruct-v0.2"  # 7B parameters
 # model_id = "meta-llama/Meta-Llama-3-8B-Instruct"  # 8B parameters
 
@@ -366,7 +366,7 @@ def main():
         split_results = process_mmlu_split(
             df, 
             split, 
-            num_questions=300,  # Test with 10 questions
+            num_questions=100,  # Test with 10 questions
             random_sample=False  # Random sample
         )
         if split_results is not None:
