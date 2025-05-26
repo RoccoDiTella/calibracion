@@ -129,7 +129,7 @@ def forward(prompt, nopts=4):
     # Save cache periodically (every 20 new entries)
     if len(cache) % 20 == 0:
         save_cache_safely(cache, cache_filename)
-        print(f"Cache saved ({len(cache)} entries)")
+        # print(f"Cache saved ({len(cache)} entries)")
     
     return scores
 
