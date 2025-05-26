@@ -366,8 +366,8 @@ def main():
         split_results = process_mmlu_split(
             df, 
             split, 
-            num_questions=600,  # Test with 10 questions
-            random_sample=False  # Random sample
+            num_questions=400,  # Test with 10 questions
+            random_sample=True  # Random sample
         )
         if split_results is not None:
             results[split] = split_results
