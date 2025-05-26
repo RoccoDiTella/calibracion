@@ -231,7 +231,7 @@ def run_experiment():
     print("="*60)
     
     train_data, val_data, true_bias, topic_difficulties = generate_synthetic_data(
-        n_topics=57, n_questions_per_topic=245, n_options=4, train_split=0.7
+        n_topics=57, n_questions_per_topic=50, n_options=4, train_split=0.7
     )
     
     # Calculate uncalibrated performance
