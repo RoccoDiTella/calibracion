@@ -231,7 +231,7 @@ def run_experiment():
     print("="*60)
     
     train_data, val_data, true_bias, topic_difficulties = generate_synthetic_data(
-        n_topics=11, n_questions_per_topic=50, n_options=4, train_split=0.7
+        n_topics=57, n_questions_per_topic=245, n_options=4, train_split=0.7
     )
     
     # Calculate uncalibrated performance
@@ -268,7 +268,7 @@ def run_experiment():
         linear_config = CalibrationConfig(
             shift_then_scale=False, share_a=shared_a, share_b=shared_b, device=device
         )
-        linear_calibrator = TorchCalibrator(linear_config, 11, 4)
+        linear_calibrator = TorchCalibrator(linear_config, 57, 4)
         linear_calibrator.fit(train_data['logits'], train_data['labels'], train_data['topics'])
         
         # Evaluate on both train and validation
@@ -284,7 +284,7 @@ def run_experiment():
         shift_config = CalibrationConfig(
             shift_then_scale=True, share_a=shared_a, share_b=shared_b, device=device
         )
-        shift_calibrator = TorchCalibrator(shift_config, 11, 4)
+        shift_calibrator = TorchCalibrator(shift_config, 57, 4)
         shift_calibrator.fit(train_data['logits'], train_data['labels'], train_data['topics'])
         
         # Evaluate on both train and validation
@@ -345,13 +345,13 @@ def run_experiment():
     linear_config = CalibrationConfig(
         shift_then_scale=False, share_a=False, share_b=True, device=device
     )
-    linear_calibrator = TorchCalibrator(linear_config, 11, 4)
+    linear_calibrator = TorchCalibrator(linear_config, 57, 4)
     linear_calibrator.fit(train_data['logits'], train_data['labels'], train_data['topics'])
     
     shift_config = CalibrationConfig(
         shift_then_scale=True, share_a=False, share_b=True, device=device
     )
-    shift_calibrator = TorchCalibrator(shift_config, 11, 4)
+    shift_calibrator = TorchCalibrator(shift_config, 57, 4)
     shift_calibrator.fit(train_data['logits'], train_data['labels'], train_data['topics'])
     
     print(f"True bias vector: {true_bias}")
