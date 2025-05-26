@@ -1,586 +1,399 @@
-#!/usr/bin/env python3
-"""
-Synthetic Data Validation for Calibration Methods
-Tests different calibration approaches with controlled ground truth
-"""
-
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy.special import softmax
+import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple
-import matplotlib.pyplot as plt
-import seaborn as sns
+import itertools
 
+# Set random seeds for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
 
-class AffineCalibrator(nn.Module):
-    """Affine calibrator: a*logits+b or a*(logits+b)"""
-    
-    def __init__(self, n_classes=4, n_subjects=1, share_a=True, share_b=True, 
-                 shift_then_scale=False, device='cpu'):
-        super().__init__()
-        self.n_classes = n_classes
-        self.n_subjects = n_subjects
+class CalibrationConfig:
+    def __init__(self, lr=0.1, max_iter=500, tol=1e-10, device='cpu', 
+                 shift_then_scale=True, share_a=False, share_b=True):
+        self.lr = lr
+        self.max_iter = max_iter
+        self.tol = tol
+        self.device = device
+        self.shift_then_scale = shift_then_scale
         self.share_a = share_a
         self.share_b = share_b
-        self.shift_then_scale = shift_then_scale
-        self.device = device
+        self.history_size = 20
+        self.line_search_fn = 'strong_wolfe'
+
+class TorchCalibrator(nn.Module):
+    def __init__(self, config, n_topics, n_classes):
+        super().__init__()
+        self.config = config
+        self.device = torch.device(config.device)
         
-        # Initialize scale parameter (in log space for stability)
-        if share_a:
-            self.log_a = nn.Parameter(torch.zeros(1, device=device))
+        if config.share_a:
+            self.loga = nn.Parameter(torch.zeros(1, device=self.device))
         else:
-            self.log_a = nn.Parameter(torch.zeros(n_subjects, device=device))
+            self.loga = nn.Parameter(torch.zeros(n_topics, device=self.device))
             
-        # Initialize bias parameter
-        if share_b:
-            self.bias = nn.Parameter(torch.zeros(n_classes, device=device))
+        if config.share_b:
+            self.b = nn.Parameter(torch.zeros(n_classes, device=self.device))
         else:
-            self.bias = nn.Parameter(torch.zeros(n_subjects, n_classes, device=device))
-    
-    def forward(self, logits, subject_indices=None):
-        """Apply calibration."""
-        batch_size = logits.shape[0]
-        
-        # Get scale parameter
-        if self.share_a:
-            a = torch.exp(self.log_a)
-            a = a.expand(batch_size, 1)
+            self.b = nn.Parameter(torch.zeros(n_topics, n_classes, device=self.device))
+
+    def forward(self, logits, topics):
+        if self.config.share_a:
+            scales = torch.exp(self.loga[0]).expand(logits.size(0), 1)
         else:
-            a = torch.exp(self.log_a[subject_indices]).unsqueeze(1)
-        
-        # Get bias parameter
-        if self.share_b:
-            b = self.bias.unsqueeze(0).expand(batch_size, -1)
+            scales = torch.exp(self.loga)[topics].unsqueeze(1)
+            
+        if self.config.share_b:
+            b_per = self.b.unsqueeze(0).expand(logits.size(0), -1)
         else:
-            b = self.bias[subject_indices]
-        
-        # Apply transformation
-        if self.shift_then_scale:
-            # a * (logits + b)
-            return a * (logits + b)
+            b_per = self.b[topics]
+            
+        if self.config.shift_then_scale:
+            return (logits + b_per) * scales
         else:
-            # a * logits + b
-            return a * logits + b
-    
-    def fit(self, logits_np, targets_np, subject_indices_np=None, 
-            lr=1.0, max_iter=10000, verbose=False):
-        """Fit using L-BFGS"""
-        # Convert to tensors
-        logits = torch.tensor(logits_np, dtype=torch.float32, device=self.device)
-        targets = torch.tensor(targets_np, dtype=torch.long, device=self.device)
+            return logits * scales + b_per
+
+    def fit(self, logits_np, targets_np, topics_np):
+        logits = torch.from_numpy(logits_np).float().to(self.device)
+        targets = torch.from_numpy(targets_np).long().to(self.device)
+        topics = torch.from_numpy(topics_np).long().to(self.device)
         
-        if subject_indices_np is not None:
-            subject_indices = torch.tensor(subject_indices_np, dtype=torch.long, device=self.device)
-        else:
-            subject_indices = torch.zeros(len(logits), dtype=torch.long, device=self.device)
-        
-        # Try multiple optimizers
-        best_loss = float('inf')
-        best_state = self.state_dict()
-        
-        # First try L-BFGS
         optimizer = torch.optim.LBFGS(
-            self.parameters(), 
-            lr=lr,
-            max_iter=100,
-            tolerance_grad=1e-12,
-            tolerance_change=1e-15,
-            line_search_fn='strong_wolfe'
+            self.parameters(),
+            lr=self.config.lr,
+            max_iter=1,
+            history_size=self.config.history_size,
+            line_search_fn=self.config.line_search_fn
         )
         
+        last_loss = float('inf')
+
         def closure():
             optimizer.zero_grad()
-            output = self.forward(logits, subject_indices)
-            loss = F.cross_entropy(output, targets)
+            out = self.forward(logits, topics)
+            loss = F.cross_entropy(out, targets)
             loss.backward()
             return loss
-        
-        for i in range(max_iter // 100):
+
+        for i in range(1, self.config.max_iter + 1):
             loss = optimizer.step(closure)
-            current_loss = loss.item()
             
-            if verbose and i % 10 == 0:
-                print(f"  Iteration {i*100}: loss = {current_loss:.8f}")
-            
-            if current_loss < best_loss:
-                best_loss = current_loss
-                best_state = self.state_dict()
-            
-            if i > 0 and abs(previous_loss - current_loss) < 1e-15:
-                break
-            previous_loss = current_loss
-        
-        # Also try Adam for comparison
-        self.load_state_dict(best_state)
-        optimizer = torch.optim.Adam(self.parameters(), lr=0.1)
-        
-        for i in range(5000):
-            optimizer.zero_grad()
-            output = self.forward(logits, subject_indices)
-            loss = F.cross_entropy(output, targets)
-            loss.backward()
-            optimizer.step()
-            
-            if loss.item() < best_loss:
-                best_loss = loss.item()
-                best_state = self.state_dict()
-        
-        self.load_state_dict(best_state)
-        return best_loss
-    
-    def predict_proba(self, logits_np, subject_indices_np=None):
-        """Get calibrated probabilities"""
-        logits = torch.tensor(logits_np, dtype=torch.float32, device=self.device)
-        
-        if subject_indices_np is not None:
-            subject_indices = torch.tensor(subject_indices_np, dtype=torch.long, device=self.device)
-        else:
-            subject_indices = torch.zeros(len(logits), dtype=torch.long, device=self.device)
-        
-        with torch.no_grad():
-            calibrated_logits = self.forward(logits, subject_indices)
-            probs = F.softmax(calibrated_logits, dim=1)
-        
-        return probs.cpu().numpy()
-
-
-def generate_simple_synthetic_data(N=1000, n_classes=4, n_subjects=10, 
-                                 scenario='global_bias', seed=42):
-    """
-    Generate synthetic data following your example structure.
-    
-    Scenarios:
-    - 'global_bias': Large bias terms affecting all subjects equally
-    - 'subject_bias': Different bias patterns per subject  
-    - 'subject_info': Different information quality per subject
-    """
-    np.random.seed(seed)
-    
-    # Generate labels uniformly
-    Y = np.random.multinomial(1, pvals=np.ones(n_classes)/n_classes, size=N)
-    y_labels = Y.argmax(axis=1)
-    
-    # Assign subjects randomly
-    subject_indices = np.random.randint(0, n_subjects, size=N)
-    
-    # Define scenario-specific parameters
-    if scenario == 'global_bias':
-        # All subjects have same large bias problem
-        bias = np.array([30.0, 20.0, 10.0, 0.0])
-        info_mean = 2.0
-        info_std = 2.0
-        
-        def logits_from_ans(y, subj_idx):
-            info = np.random.normal(info_mean, info_std)
-            noise = np.random.normal(0, 1, size=n_classes)
-            return y * info + bias + noise
-            
-    elif scenario == 'subject_bias':
-        # Each subject has different bias
-        biases = []
-        for s in range(n_subjects):
-            # Random ordering of bias magnitudes
-            mags = [30, 20, 10, 0]
-            np.random.shuffle(mags)
-            biases.append(np.array(mags, dtype=float))
-        biases = np.array(biases)
-        
-        info_mean = 2.0
-        info_std = 2.0
-        
-        def logits_from_ans(y, subj_idx):
-            info = np.random.normal(info_mean, info_std)
-            noise = np.random.normal(0, 1, size=n_classes)
-            return y * info + biases[subj_idx] + noise
-            
-    elif scenario == 'subject_info':
-        # Each subject has different information quality
-        bias = np.array([30.0, 20.0, 10.0, 0.0])
-        info_means = np.random.uniform(0.5, 4.0, n_subjects)
-        info_stds = np.random.uniform(0.5, 3.0, n_subjects)
-        
-        def logits_from_ans(y, subj_idx):
-            info = np.random.normal(info_means[subj_idx], info_stds[subj_idx])
-            noise = np.random.normal(0, 1, size=n_classes)
-            return y * info + bias + noise
-    
-    else:  # 'mixed'
-        # Both bias and info vary by subject
-        biases = []
-        for s in range(n_subjects):
-            base = np.random.uniform(20, 40)
-            biases.append(np.array([base, base-10, base-20, 0]))
-        biases = np.array(biases)
-        
-        info_means = np.random.uniform(1.0, 3.0, n_subjects)
-        info_stds = np.random.uniform(1.0, 2.0, n_subjects)
-        
-        def logits_from_ans(y, subj_idx):
-            info = np.random.normal(info_means[subj_idx], info_stds[subj_idx])
-            noise = np.random.normal(0, 1, size=n_classes)
-            return y * info + biases[subj_idx] + noise
-    
-    # Generate logits
-    X_logits = []
-    for i in range(N):
-        logits = logits_from_ans(Y[i], subject_indices[i])
-        X_logits.append(logits)
-    
-    X_logits = np.array(X_logits, dtype=np.float32)
-    
-    return X_logits, y_labels, subject_indices, {'scenario': scenario}
-
-
-def compute_metrics(probs, targets):
-    """Compute accuracy, NCE, and ECE"""
-    pred = np.argmax(probs, axis=1)
-    acc = np.mean(pred == targets)
-    
-    # NCE
-    epsilon = 1e-15
-    correct_probs = probs[np.arange(len(targets)), targets]
-    nll = -np.mean(np.log(correct_probs + epsilon))
-    nce = nll / np.log(4)
-    
-    # ECE
-    pred_conf = np.max(probs, axis=1)
-    correct = (pred == targets)
-    
-    n_bins = 10
-    bin_boundaries = np.linspace(0, 1, n_bins + 1)
-    ece = 0.0
-    
-    for i in range(n_bins):
-        in_bin = (pred_conf > bin_boundaries[i]) & (pred_conf <= bin_boundaries[i+1])
-        if in_bin.sum() > 0:
-            bin_acc = correct[in_bin].mean()
-            bin_conf = pred_conf[in_bin].mean()
-            ece += np.abs(bin_acc - bin_conf) * in_bin.mean()
-    
-    return {'accuracy': acc, 'nce': nce, 'ece': ece}
-
-
-def analyze_logit_statistics(X_logits, y_labels, subject_indices):
-    """Analyze the properties of generated logits"""
-    n_subjects = len(np.unique(subject_indices))
-    
-    print("\nLogit Statistics:")
-    print("-" * 50)
-    
-    # Overall statistics
-    print(f"Overall logit range: [{X_logits.min():.1f}, {X_logits.max():.1f}]")
-    print(f"Overall logit mean: {X_logits.mean():.1f} ± {X_logits.std():.1f}")
-    
-    # Correct vs incorrect logits
-    correct_logits = []
-    incorrect_logits = []
-    
-    for i, (logits, label) in enumerate(zip(X_logits, y_labels)):
-        correct_logits.append(logits[label])
-        incorrect_logits.extend(logits[np.arange(len(logits)) != label])
-    
-    correct_logits = np.array(correct_logits)
-    incorrect_logits = np.array(incorrect_logits)
-    
-    print(f"\nCorrect answer logits: {correct_logits.mean():.1f} ± {correct_logits.std():.1f}")
-    print(f"Incorrect answer logits: {incorrect_logits.mean():.1f} ± {incorrect_logits.std():.1f}")
-    print(f"Signal (difference): {correct_logits.mean() - incorrect_logits.mean():.1f}")
-    
-    # Per-subject analysis
-    if n_subjects > 1:
-        print("\nPer-subject signal strength:")
-        for s in range(min(5, n_subjects)):  # Show first 5 subjects
-            mask = subject_indices == s
-            if mask.sum() > 0:
-                subj_correct = []
-                subj_incorrect = []
-                for i in np.where(mask)[0]:
-                    logits = X_logits[i]
-                    label = y_labels[i]
-                    subj_correct.append(logits[label])
-                    subj_incorrect.extend(logits[np.arange(len(logits)) != label])
-                
-                signal = np.mean(subj_correct) - np.mean(subj_incorrect)
-                print(f"  Subject {s}: {signal:.1f}")
-
-
-def run_experiment(train_data, eval_data, config_name, transform, n_subjects, 
-                  n_seeds=3, verbose=False):
-    """Run calibration experiment"""
-    train_logits, train_targets, train_subjects = train_data
-    eval_logits, eval_targets, eval_subjects = eval_data
-    
-    # Parse config
-    share_a = 'a_global' in config_name
-    share_b = 'b_global' in config_name
-    shift_then_scale = (transform == 'a*(logits+b)')
-    
-    best_eval_nce = float('inf')
-    best_model = None
-    
-    # Try multiple seeds
-    for seed in range(n_seeds):
-        torch.manual_seed(seed)
-        
-        # Try different learning rates
-        for lr in [0.1, 0.5, 1.0, 2.0]:
-            model = AffineCalibrator(
-                n_classes=4, n_subjects=n_subjects,
-                share_a=share_a, share_b=share_b,
-                shift_then_scale=shift_then_scale
-            )
-            
-            # Initialize with small random values
             with torch.no_grad():
-                model.log_a.data += torch.randn_like(model.log_a) * 0.1
-                model.bias.data += torch.randn_like(model.bias) * 0.1
+                out = self.forward(logits, topics)
+                ce = F.cross_entropy(out, targets).item()
+                
+            if abs(last_loss - ce) < self.config.tol:
+                print(f"  Converged at iteration {i}, loss: {ce:.6f}")
+                break
+            last_loss = ce
             
-            final_loss = model.fit(
-                train_logits, train_targets, train_subjects,
-                lr=lr, verbose=verbose
-            )
+        if i == self.config.max_iter:
+            print(f"  Max iterations reached, final loss: {ce:.6f}")
+
+    def predict_logits(self, logits_np, topics_np):
+        logits = torch.from_numpy(logits_np).float().to(self.device)
+        topics = torch.from_numpy(topics_np).long().to(self.device)
+        with torch.no_grad():
+            out = self.forward(logits, topics)
+        return out.cpu().numpy()
+
+def generate_synthetic_data(n_topics=5, n_questions_per_topic=100, n_options=4, train_split=0.7):
+    """Generate synthetic MMLU-like data with known biases"""
+    
+    # True parameters we'll try to recover
+    true_bias = np.array([1.0, -0.8, 1.5, -0.7])  # Strong position bias
+    topic_difficulties = np.linspace(0.8, 2.5, n_topics)  # Per-topic scaling
+    
+    all_logits = []
+    all_labels = []
+    all_topics = []
+    all_question_ids = []
+    
+    question_id = 0
+    
+    for topic_idx in range(n_topics):
+        topic_difficulty = topic_difficulties[topic_idx]
+        
+        for q_idx in range(n_questions_per_topic):
+            # Generate "true" log-likelihoods for this question
+            true_logits = np.random.normal(0, 1.0, n_options)
+            correct_answer = np.random.randint(0, n_options)
+            true_logits[correct_answer] += topic_difficulty  # Topic-dependent boost
             
-            # Evaluate
-            eval_probs = model.predict_proba(eval_logits, eval_subjects)
-            eval_metrics = compute_metrics(eval_probs, eval_targets)
+            # Generate all 24 permutations
+            for perm in itertools.permutations(range(n_options)):
+                # Apply permutation to true logits
+                permuted_true_logits = true_logits[list(perm)]
+                
+                # Add position bias (this is what we want to recover)
+                observed_logits = permuted_true_logits + true_bias
+                
+                # Find where correct answer ended up after permutation
+                new_correct_idx = perm.index(correct_answer)
+                
+                all_logits.append(observed_logits)
+                all_labels.append(new_correct_idx)
+                all_topics.append(topic_idx)
+                all_question_ids.append(question_id)
             
-            if eval_metrics['nce'] < best_eval_nce:
-                best_eval_nce = eval_metrics['nce']
-                best_model = model
+            question_id += 1
     
-    # Final evaluation with best model
-    train_probs = best_model.predict_proba(train_logits, train_subjects)
-    eval_probs = best_model.predict_proba(eval_logits, eval_subjects)
+    logits = np.array(all_logits)
+    labels = np.array(all_labels)
+    topics = np.array(all_topics)
+    question_ids = np.array(all_question_ids)
     
-    train_metrics = compute_metrics(train_probs, train_targets)
-    eval_metrics = compute_metrics(eval_probs, eval_targets)
+    # Split by questions (not by permutations) to avoid data leakage
+    unique_questions = np.unique(question_ids)
+    n_train_questions = int(len(unique_questions) * train_split)
     
-    # Get parameters
-    with torch.no_grad():
-        a_vals = torch.exp(best_model.log_a).cpu().numpy()
-        b_vals = best_model.bias.cpu().numpy()
+    # Shuffle questions for random split
+    np.random.shuffle(unique_questions)
+    train_questions = unique_questions[:n_train_questions]
+    val_questions = unique_questions[n_train_questions:]
     
-    return {
-        'config': config_name,
-        'transform': transform,
-        'train_metrics': train_metrics,
-        'eval_metrics': eval_metrics,
-        'n_params': sum(p.numel() for p in best_model.parameters()),
-        'a_vals': a_vals,
-        'b_vals': b_vals,
-        'model': best_model
+    # Create train/val masks
+    train_mask = np.isin(question_ids, train_questions)
+    val_mask = np.isin(question_ids, val_questions)
+    
+    train_data = {
+        'logits': logits[train_mask],
+        'labels': labels[train_mask],
+        'topics': topics[train_mask],
+        'question_ids': question_ids[train_mask]
     }
+    
+    val_data = {
+        'logits': logits[val_mask],
+        'labels': labels[val_mask],
+        'topics': topics[val_mask],
+        'question_ids': question_ids[val_mask]
+    }
+    
+    print(f"Generated {len(logits)} total samples:")
+    print(f"  - {n_topics} topics")
+    print(f"  - {n_questions_per_topic} questions per topic")
+    print(f"  - 24 permutations per question")
+    print(f"  - Train: {len(train_data['logits'])} samples ({len(train_questions)} questions)")
+    print(f"  - Validation: {len(val_data['logits'])} samples ({len(val_questions)} questions)")
+    print(f"  - True bias: {true_bias}")
+    print(f"  - Topic difficulties: {topic_difficulties}")
+    
+    return train_data, val_data, true_bias, topic_difficulties
 
+def evaluate_performance(logits, labels, topics, calibrator):
+    """Evaluate calibration performance with Normalized Cross Entropy"""
+    calibrated_logits = calibrator.predict_logits(logits, topics)
+    
+    # Calculate accuracy
+    predictions = np.argmax(calibrated_logits, axis=1)
+    accuracy = np.mean(predictions == labels)
+    
+    # Calculate cross-entropy loss
+    probs = np.exp(calibrated_logits - np.max(calibrated_logits, axis=1, keepdims=True))
+    probs = probs / np.sum(probs, axis=1, keepdims=True)
+    probs = np.clip(probs, 1e-12, 1.0)
+    ce_loss = -np.mean(np.log(probs[np.arange(len(labels)), labels]))
+    
+    # Calculate Normalized Cross Entropy (NCE)
+    # NCE = CE / CE_uniform where CE_uniform = log(num_classes)
+    n_classes = calibrated_logits.shape[1]
+    ce_uniform = np.log(n_classes)
+    nce = ce_loss / ce_uniform
+    
+    return accuracy, ce_loss, nce
 
-def visualize_calibration_effects(original_logits, model, subject_idx=0):
-    """Visualize how calibration transforms the logits"""
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+def calculate_uncalibrated_performance(logits, labels):
+    """Calculate uncalibrated performance metrics"""
+    predictions = np.argmax(logits, axis=1)
+    accuracy = np.mean(predictions == labels)
     
-    # Sample logits for visualization
-    sample_logits = original_logits[:100]
+    probs = np.exp(logits - np.max(logits, axis=1, keepdims=True))
+    probs = probs / np.sum(probs, axis=1, keepdims=True)
+    probs = np.clip(probs, 1e-12, 1.0)
+    ce_loss = -np.mean(np.log(probs[np.arange(len(labels)), labels]))
     
-    # Original probabilities
-    ax = axes[0]
-    orig_probs = softmax(sample_logits, axis=1)
-    im = ax.imshow(orig_probs.T, aspect='auto', cmap='viridis')
-    ax.set_title('Original Probabilities')
-    ax.set_xlabel('Sample')
-    ax.set_ylabel('Class')
-    plt.colorbar(im, ax=ax)
+    n_classes = logits.shape[1]
+    ce_uniform = np.log(n_classes)
+    nce = ce_loss / ce_uniform
     
-    # Calibrated probabilities
-    ax = axes[1]
-    cal_probs = model.predict_proba(sample_logits, 
-                                   np.full(len(sample_logits), subject_idx))
-    im = ax.imshow(cal_probs.T, aspect='auto', cmap='viridis')
-    ax.set_title('Calibrated Probabilities')
-    ax.set_xlabel('Sample')
-    ax.set_ylabel('Class')
-    plt.colorbar(im, ax=ax)
-    
-    # Difference
-    ax = axes[2]
-    diff = cal_probs - orig_probs
-    im = ax.imshow(diff.T, aspect='auto', cmap='RdBu', vmin=-0.5, vmax=0.5)
-    ax.set_title('Difference (Calibrated - Original)')
-    ax.set_xlabel('Sample')
-    ax.set_ylabel('Class')
-    plt.colorbar(im, ax=ax)
-    
-    plt.tight_layout()
-    return fig
+    return accuracy, ce_loss, nce
 
-
-def main():
-    """Main validation experiment"""
-    print("=" * 80)
-    print("SYNTHETIC CALIBRATION VALIDATION")
-    print("=" * 80)
+def run_experiment():
+    """Run the complete calibration experiment"""
+    device = 'cpu'
+    print(f"Using device: {device}")
     
-    # Configurations to test
+    # Generate synthetic data with train/val split
+    print("\n" + "="*60)
+    print("GENERATING SYNTHETIC DATA")
+    print("="*60)
+    
+    train_data, val_data, true_bias, topic_difficulties = generate_synthetic_data(
+        n_topics=5, n_questions_per_topic=100, n_options=4, train_split=0.7
+    )
+    
+    # Calculate uncalibrated performance
+    train_acc, train_ce, train_nce = calculate_uncalibrated_performance(
+        train_data['logits'], train_data['labels']
+    )
+    val_acc, val_ce, val_nce = calculate_uncalibrated_performance(
+        val_data['logits'], val_data['labels']
+    )
+    
+    print(f"\nUncalibrated performance:")
+    print(f"  Train - Accuracy: {train_acc:.4f}, CE: {train_ce:.4f}, NCE: {train_nce:.4f}")
+    print(f"  Val   - Accuracy: {val_acc:.4f}, CE: {val_ce:.4f}, NCE: {val_nce:.4f}")
+    
+    # Test configurations
     configs = [
-        ('a_global_b_global', 'a*logits+b'),
-        ('a_global_b_global', 'a*(logits+b)'),
-        ('a_subject_b_global', 'a*logits+b'),
-        ('a_subject_b_global', 'a*(logits+b)'),
-        ('a_subject_b_subject', 'a*logits+b'),
-        ('a_subject_b_subject', 'a*(logits+b)'),
+        ('a_shared', 'b_shared', True, True),
+        ('a_topic', 'b_shared', False, True),
+        ('a_topic', 'b_topic', False, False),
     ]
     
-    # Test different scenarios
-    scenarios = ['global_bias', 'subject_bias', 'subject_info', 'mixed']
+    results = []
     
-    all_results = []
+    print("\n" + "="*60)
+    print("RUNNING CALIBRATION EXPERIMENTS")
+    print("="*60)
     
-    for scenario in scenarios:
-        print(f"\n{'='*60}")
-        print(f"SCENARIO: {scenario}")
-        print(f"{'='*60}")
+    for config_name, b_name, shared_a, shared_b in configs:
+        print(f"\nConfiguration: {config_name}, {b_name}")
+        print("-" * 40)
         
-        # Generate data
-        N = 5000
-        n_subjects = 10
+        # Linear calibration: a * logits + b
+        print("Optimizing a * logits + b...")
+        linear_config = CalibrationConfig(
+            shift_then_scale=False, share_a=shared_a, share_b=shared_b, device=device
+        )
+        linear_calibrator = TorchCalibrator(linear_config, 5, 4)
+        linear_calibrator.fit(train_data['logits'], train_data['labels'], train_data['topics'])
         
-        X_logits, y_labels, subject_indices, info = generate_simple_synthetic_data(
-            N=N, n_subjects=n_subjects, scenario=scenario, seed=42
+        # Evaluate on both train and validation
+        linear_train_acc, linear_train_ce, linear_train_nce = evaluate_performance(
+            train_data['logits'], train_data['labels'], train_data['topics'], linear_calibrator
+        )
+        linear_val_acc, linear_val_ce, linear_val_nce = evaluate_performance(
+            val_data['logits'], val_data['labels'], val_data['topics'], linear_calibrator
         )
         
-        # Analyze the generated data
-        analyze_logit_statistics(X_logits, y_labels, subject_indices)
+        # Shift-scale calibration: a * (logits + b)
+        print("Optimizing a * (logits + b)...")
+        shift_config = CalibrationConfig(
+            shift_then_scale=True, share_a=shared_a, share_b=shared_b, device=device
+        )
+        shift_calibrator = TorchCalibrator(shift_config, 5, 4)
+        shift_calibrator.fit(train_data['logits'], train_data['labels'], train_data['topics'])
         
-        # Split data
-        split = int(0.8 * N)
-        train_data = (X_logits[:split], y_labels[:split], subject_indices[:split])
-        eval_data = (X_logits[split:], y_labels[split:], subject_indices[split:])
+        # Evaluate on both train and validation
+        shift_train_acc, shift_train_ce, shift_train_nce = evaluate_performance(
+            train_data['logits'], train_data['labels'], train_data['topics'], shift_calibrator
+        )
+        shift_val_acc, shift_val_ce, shift_val_nce = evaluate_performance(
+            val_data['logits'], val_data['labels'], val_data['topics'], shift_calibrator
+        )
         
-        # Baseline performance
-        eval_probs_uncal = softmax(eval_data[0], axis=1)
-        baseline_metrics = compute_metrics(eval_probs_uncal, eval_data[1])
+        results.append({
+            'Configuration': f"{config_name}, {b_name}",
+            'Uncalibrated_Val': val_nce,
+            'Linear_Train': linear_train_nce,
+            'Linear_Val': linear_val_nce,
+            'Shift_Train': shift_train_nce,
+            'Shift_Val': shift_val_nce,
+            'Linear_Val_Acc': linear_val_acc,
+            'Shift_Val_Acc': shift_val_acc
+        })
         
-        print(f"\nUncalibrated baseline:")
-        print(f"  Accuracy: {baseline_metrics['accuracy']:.4f}")
-        print(f"  NCE: {baseline_metrics['nce']:.4f}")
-        print(f"  ECE: {baseline_metrics['ece']:.4f}")
-        
-        # Test all configurations
-        scenario_results = []
-        
-        print("\nTesting calibration methods:")
-        for config_name, transform in configs:
-            result = run_experiment(
-                train_data, eval_data, config_name, transform, 
-                n_subjects, n_seeds=3, verbose=False
-            )
-            
-            result['scenario'] = scenario
-            result['baseline_metrics'] = baseline_metrics
-            scenario_results.append(result)
-            
-            eval_m = result['eval_metrics']
-            print(f"  {config_name:20s} {transform:15s}: "
-                  f"NCE={eval_m['nce']:.4f} "
-                  f"(Δ={baseline_metrics['nce']-eval_m['nce']:+.4f}), "
-                  f"ECE={eval_m['ece']:.4f}")
-        
-        # Find best method
-        best_idx = min(range(len(scenario_results)), 
-                      key=lambda i: scenario_results[i]['eval_metrics']['nce'])
-        best = scenario_results[best_idx]
-        
-        print(f"\nBest method: {best['config']} - {best['transform']}")
-        print(f"  NCE improvement: {best['baseline_metrics']['nce'] - best['eval_metrics']['nce']:.4f}")
-        
-        # Visualize calibration effect for best method
-        fig = visualize_calibration_effects(eval_data[0][:100], best['model'])
-        plt.suptitle(f'Calibration Effect - {scenario} - {best["config"]} {best["transform"]}')
-        # plt.savefig(f'calibration_effect_{scenario}.png', dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        # Parameter analysis
-        print(f"\nCalibration parameters:")
-        print(f"  Scale (a): mean={np.mean(best['a_vals']):.3f}, "
-              f"std={np.std(best['a_vals']):.3f}")
-        print(f"  Bias (b): {best['b_vals']}")
-        
-        all_results.extend(scenario_results)
+        print(f"  Linear (a*logit+b):")
+        print(f"    Train - Acc: {linear_train_acc:.4f}, NCE: {linear_train_nce:.4f}")
+        print(f"    Val   - Acc: {linear_val_acc:.4f}, NCE: {linear_val_nce:.4f}")
+        print(f"  Shift-Scale (a*(logit+b)):")
+        print(f"    Train - Acc: {shift_train_acc:.4f}, NCE: {shift_train_nce:.4f}")
+        print(f"    Val   - Acc: {shift_val_acc:.4f}, NCE: {shift_val_nce:.4f}")
     
-    # Summary visualization
-    print("\n" + "=" * 80)
-    print("SUMMARY")
-    print("=" * 80)
+    # Create results table focused on validation NCE
+    print("\n" + "="*80)
+    print("FINAL RESULTS TABLE (Normalized Cross Entropy)")
+    print("="*80)
     
-    # Create summary plot
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    df = pd.DataFrame(results)
+    df_display = df[['Configuration', 'Uncalibrated_Val', 'Linear_Val', 'Shift_Val']].copy()
+    df_display.columns = ['Configuration', 'Uncalibrated', 'a*logit+b', 'a*(logit+b)']
     
-    results_df = pd.DataFrame([{
-        'scenario': r['scenario'],
-        'config': r['config'],
-        'transform': r['transform'],
-        'nce': r['eval_metrics']['nce'],
-        'ece': r['eval_metrics']['ece'],
-        'nce_improvement': r['baseline_metrics']['nce'] - r['eval_metrics']['nce']
-    } for r in all_results])
+    print(df_display.to_string(index=False, float_format='%.4f'))
     
-    # NCE by scenario and method
-    ax = axes[0, 0]
-    pivot = results_df.pivot_table(
-        index=['config', 'transform'], 
-        columns='scenario', 
-        values='nce'
+    # Show parameter recovery for the most interesting case
+    print("\n" + "="*60)
+    print("PARAMETER RECOVERY ANALYSIS")
+    print("="*60)
+    
+    # Focus on the case where b is shared but a is per-topic (most interesting case)
+    linear_config = CalibrationConfig(
+        shift_then_scale=False, share_a=False, share_b=True, device=device
     )
-    pivot.plot(kind='bar', ax=ax)
-    ax.set_ylabel('NCE')
-    ax.set_title('NCE by Method and Scenario')
-    ax.legend(title='Scenario', bbox_to_anchor=(1.05, 1), loc='upper left')
+    linear_calibrator = TorchCalibrator(linear_config, 5, 4)
+    linear_calibrator.fit(train_data['logits'], train_data['labels'], train_data['topics'])
     
-    # ECE by scenario and method
-    ax = axes[0, 1]
-    pivot = results_df.pivot_table(
-        index=['config', 'transform'], 
-        columns='scenario', 
-        values='ece'
+    shift_config = CalibrationConfig(
+        shift_then_scale=True, share_a=False, share_b=True, device=device
     )
-    pivot.plot(kind='bar', ax=ax)
-    ax.set_ylabel('ECE')
-    ax.set_title('ECE by Method and Scenario')
-    ax.legend(title='Scenario', bbox_to_anchor=(1.05, 1), loc='upper left')
+    shift_calibrator = TorchCalibrator(shift_config, 5, 4)
+    shift_calibrator.fit(train_data['logits'], train_data['labels'], train_data['topics'])
     
-    # Best method per scenario
-    ax = axes[1, 0]
-    best_methods = results_df.loc[results_df.groupby('scenario')['nce'].idxmin()]
-    best_counts = best_methods.groupby(['config', 'transform']).size()
-    best_counts.plot(kind='bar', ax=ax)
-    ax.set_ylabel('Times Selected as Best')
-    ax.set_title('Best Method Frequency')
+    print(f"True bias vector: {true_bias}")
+    print(f"True topic difficulties: {topic_difficulties}")
+    print()
     
-    # NCE improvement distribution
-    ax = axes[1, 1]
-    for scenario in scenarios:
-        data = results_df[results_df['scenario'] == scenario]['nce_improvement']
-        ax.hist(data, alpha=0.5, label=scenario, bins=10)
-    ax.set_xlabel('NCE Improvement')
-    ax.set_ylabel('Count')
-    ax.set_title('NCE Improvement Distribution')
-    ax.legend()
+    # Extract parameters
+    with torch.no_grad():
+        linear_b = linear_calibrator.b.cpu().numpy()
+        linear_a = np.exp(linear_calibrator.loga.cpu().numpy())
+        
+        shift_b = shift_calibrator.b.cpu().numpy()
+        shift_a = np.exp(shift_calibrator.loga.cpu().numpy())
     
-    plt.tight_layout()
-    # plt.savefig('calibration_summary.png', dpi=150, bbox_inches='tight')
-    plt.close()
+    print(f"Linear method b (shared):      {linear_b}")
+    print(f"Shift-scale method b (shared): {shift_b}")
+    print()
+    print(f"Linear method a (per-topic):      {linear_a}")
+    print(f"Shift-scale method a (per-topic): {shift_a}")
     
-    # Print best method for each scenario
-    print("\nBest method by scenario:")
-    for scenario in scenarios:
-        scenario_data = results_df[results_df['scenario'] == scenario]
-        best_idx = scenario_data['nce'].idxmin()
-        best = scenario_data.loc[best_idx]
-        print(f"  {scenario:15s}: {best['config']:20s} {best['transform']:15s} "
-              f"(NCE={best['nce']:.4f}, Δ={best['nce_improvement']:.4f})")
+    # Compare bias recovery
+    print(f"\nBias recovery analysis:")
+    linear_bias_error = np.mean((true_bias - linear_b)**2)
+    shift_bias_error = np.mean((true_bias - shift_b)**2)
     
-    print("\nValidation complete! Check generated plots for visualizations.")
-
+    print(f"Linear method bias MSE:      {linear_bias_error:.4f}")
+    print(f"Shift-scale method bias MSE: {shift_bias_error:.4f}")
+    
+    if shift_bias_error < linear_bias_error:
+        print("✓ Shift-scale method better recovers the true bias!")
+    else:
+        print("✗ Linear method better recovers the true bias")
+    
+    # Compare scaling recovery
+    print(f"\nScaling recovery analysis:")
+    linear_scale_error = np.mean((topic_difficulties - linear_a)**2)
+    shift_scale_error = np.mean((topic_difficulties - shift_a)**2)
+    
+    print(f"Linear method scaling MSE:      {linear_scale_error:.4f}")
+    print(f"Shift-scale method scaling MSE: {shift_scale_error:.4f}")
+    
+    print(f"\n" + "="*60)
+    print("EXPERIMENT SUMMARY")
+    print("="*60)
+    print("This experiment tests the hypothesis that when bias (b) is shared")
+    print("across topics but scaling (a) is per-topic, the shift-scale method")
+    print("a*(logit + b) should better recover the true bias than a*logit + b.")
+    print("This is because the shift-scale method first removes the position")
+    print("bias before applying topic-specific scaling.")
+    print()
+    print("Key metric: Normalized Cross Entropy (NCE) = CrossEntropy / log(4)")
+    print("Lower NCE indicates better calibration performance.")
+    
+    return df_display, true_bias, topic_difficulties
 
 if __name__ == "__main__":
-    main()
+    results_df, true_bias, topic_difficulties = run_experiment()
