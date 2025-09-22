@@ -62,31 +62,52 @@ class TorchCalibrator(nn.Module):
         return (logits + b_per) * scales if self.config.shift_then_scale else logits * scales + b_per
 
     def fit(self, logits_np, targets_np, topics_np, verbose=False):
-        # full-batch tensors in float64 for stability
-        logits = torch.from_numpy(logits_np).to(self.device, dtype=self.dtype)
-        targets = torch.from_numpy(targets_np).to(self.device, dtype=torch.long)
-        topics  = torch.from_numpy(topics_np).to(self.device, dtype=torch.long)
+        # Full-batch, double precision on CPU is most robust for LBFGS on tiny param sets
+        device = torch.device('cpu')  # <= force CPU for LBFGS stability
+        logits = torch.from_numpy(logits_np).to(device=device, dtype=torch.float64)
+        targets = torch.from_numpy(targets_np).to(device=device, dtype=torch.long)
+        topics  = torch.from_numpy(topics_np).to(device=device, dtype=torch.long)
+
+        # also move params to CPU/double once
+        self.to(device=device, dtype=torch.float64)
+
+        # Keep a copy to measure Δparam
+        with torch.no_grad():
+            p0 = torch.cat([p.detach().flatten().clone() for p in self.parameters()])
 
         optimizer = torch.optim.LBFGS(
             self.parameters(),
-            lr=self.config.lr,
-            max_iter=self.config.max_iter,          # let LBFGS iterate internally
-            history_size=self.config.history_size,
-            line_search_fn=self.config.line_search_fn,
-            tolerance_grad=self.config.tol,
-            tolerance_change=self.config.tol
+            lr=self.config.lr if hasattr(self.config, 'lr') else 1.0,
+            max_iter=self.config.max_iter if hasattr(self.config, 'max_iter') else 50,
+            history_size=self.config.history_size if hasattr(self.config, 'history_size') else 100,
+            # Remove strong_wolfe; default line search tends to be less finicky here
+            # line_search_fn=None  # default
+            tolerance_grad=self.config.tol if hasattr(self.config, 'tol') else 1e-7,
+            tolerance_change=self.config.tol if hasattr(self.config, 'tol') else 1e-7,
         )
+
+        it = {'k': 0}  # small mutable to count closures
 
         def closure():
             optimizer.zero_grad(set_to_none=True)
             out = self.forward(logits, topics)
-            loss = F.cross_entropy(out, targets)   # no regularization
+            loss = F.cross_entropy(out, targets)  # no regularization
             loss.backward()
+            if verbose and it['k'] in (0, 1):  # print gradient norms at first few closures
+                gnorm = torch.sqrt(sum((p.grad.detach()**2).sum() for p in self.parameters() if p.grad is not None)).item()
+                print(f"    closure {it['k']}: loss={loss.item():.6f}, ||grad||={gnorm:.3e}")
+            it['k'] += 1
             return loss
 
         final_loss = optimizer.step(closure).item()
-        if verbose:
-            print(f"  LBFGS finished, loss: {final_loss:.6f}")
+
+        # Report parameter movement
+        with torch.no_grad():
+            p1 = torch.cat([p.detach().flatten() for p in self.parameters()])
+            delta = (p1 - p0)
+            dnorm = delta.norm().item()
+            if verbose:
+                print(f"  LBFGS finished, loss: {final_loss:.6f}, ||Δparam||={dnorm:.3e}")
 
     def predict_logits(self, logits_np, topics_np):
         logits = torch.from_numpy(logits_np).to(self.device, dtype=self.dtype)
