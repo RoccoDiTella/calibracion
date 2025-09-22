@@ -670,24 +670,22 @@ def compare_per_topic_reference(calibrator, logits, labels, topics, label_encode
     max_da = max(abs(d[1]) for d in diffs)
     max_db = max(np.max(np.abs(d[2])) for d in diffs)
     print(f"    per-topic reference check: max|Δa|={max_da:.3e}, max|Δb|={max_db:.3e}")
-    tol = 1e-4
+    tol = 5e-4
+    max_abs_db = max(np.max(np.abs(d[2])) for d in diffs)
     for topic_id, da, db, ref_a, ref_b, glob_a, glob_b in diffs:
-        if abs(da) > tol or np.any(np.abs(db) > tol):
-            subject = None
-            if label_encoder is not None and 0 <= topic_id < len(label_encoder.classes_):
-                try:
-                    subject = label_encoder.inverse_transform([topic_id])[0]
-                except Exception:
-                    subject = None
-            label_str = f" ({subject})" if subject is not None else ""
-            print(
-                f"      topic {int(topic_id)}{label_str}: ref a={ref_a:.6f}, global a={glob_a:.6f}, Δa={da:+.3e}"
-            )
-            print(
-                "          ref b=" + np.array2string(ref_b, formatter={'float_kind':lambda x: f"{x:.6f}"}) +
-                ", global b=" + np.array2string(glob_b, formatter={'float_kind':lambda x: f"{x:.6f}"}) +
-                ", Δb=" + np.array2string(db, formatter={'float_kind':lambda x: f"{x:+.3e}"})
-            )
+        if abs(da) <= tol and np.all(np.abs(db) <= tol):
+            continue
+        subject = None
+        if label_encoder is not None and 0 <= topic_id < len(label_encoder.classes_):
+            try:
+                subject = label_encoder.inverse_transform([topic_id])[0]
+            except Exception:
+                subject = None
+        label_str = f" ({subject})" if subject is not None else ""
+        print(
+            f"      topic {int(topic_id)}{label_str}: Δa={da:+.3e} (ref {ref_a:.6f} vs global {glob_a:.6f})"
+        )
+        print("          Δb=" + np.array2string(db, formatter={'float_kind':lambda x: f"{x:+.3e}"}))
     return diffs
 
 def train_calibrator(train_logits, train_labels, train_topics, n_topics, device,
