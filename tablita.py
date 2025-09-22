@@ -7,97 +7,90 @@ from sklearn.model_selection import KFold
 from sklearn.preprocessing import LabelEncoder
 import warnings
 warnings.filterwarnings('ignore')
+import math
+import matplotlib.pyplot as plt
 
 # Set random seeds for reproducibility
 torch.manual_seed(42)
 np.random.seed(42)
 
+# --- 1) Config: add dtype, use saner tolerances, larger history
 class CalibrationConfig:
-    def __init__(self, lr=0.1, max_iter=500, tol=1e-10, device='cuda', 
-                 shift_then_scale=True, share_a=False, share_b=True):
+    def __init__(self, lr=1.0, max_iter=50, tol=1e-7, device='cpu',
+                 shift_then_scale=True, share_a=False, share_b=True,
+                 dtype=torch.float64):
         self.lr = lr
-        self.max_iter = max_iter
-        self.tol = tol
+        self.max_iter = max_iter         # internal LBFGS iterations
+        self.tol = tol                   # used for LBFGS tolerances
         self.device = device
         self.shift_then_scale = shift_then_scale
         self.share_a = share_a
         self.share_b = share_b
-        self.history_size = 20
+        self.history_size = 100
         self.line_search_fn = 'strong_wolfe'
+        self.dtype = dtype
 
+# --- 2) TorchCalibrator: carry dtype through parameters
 class TorchCalibrator(nn.Module):
     def __init__(self, config, n_topics, n_classes):
         super().__init__()
         self.config = config
         self.device = torch.device(config.device)
-        
+        self.dtype = config.dtype
+
         if config.share_a:
-            self.loga = nn.Parameter(torch.zeros(1, device=self.device))
+            self.loga = nn.Parameter(torch.zeros(1, device=self.device, dtype=self.dtype))
         else:
-            self.loga = nn.Parameter(torch.zeros(n_topics, device=self.device))
-            
+            self.loga = nn.Parameter(torch.zeros(n_topics, device=self.device, dtype=self.dtype))
+
         if config.share_b:
-            self.b = nn.Parameter(torch.zeros(n_classes, device=self.device))
+            self.b = nn.Parameter(torch.zeros(n_classes, device=self.device, dtype=self.dtype))
         else:
-            self.b = nn.Parameter(torch.zeros(n_topics, n_classes, device=self.device))
+            self.b = nn.Parameter(torch.zeros(n_topics, n_classes, device=self.device, dtype=self.dtype))
 
     def forward(self, logits, topics):
         if self.config.share_a:
             scales = torch.exp(self.loga[0]).expand(logits.size(0), 1)
         else:
             scales = torch.exp(self.loga)[topics].unsqueeze(1)
-            
+
         if self.config.share_b:
             b_per = self.b.unsqueeze(0).expand(logits.size(0), -1)
         else:
             b_per = self.b[topics]
-            
-        if self.config.shift_then_scale:
-            return (logits + b_per) * scales
-        else:
-            return logits * scales + b_per
+
+        return (logits + b_per) * scales if self.config.shift_then_scale else logits * scales + b_per
 
     def fit(self, logits_np, targets_np, topics_np, verbose=False):
-        logits = torch.from_numpy(logits_np).float().to(self.device)
-        targets = torch.from_numpy(targets_np).long().to(self.device)
-        topics = torch.from_numpy(topics_np).long().to(self.device)
-        
+        # full-batch tensors in float64 for stability
+        logits = torch.from_numpy(logits_np).to(self.device, dtype=self.dtype)
+        targets = torch.from_numpy(targets_np).to(self.device, dtype=torch.long)
+        topics  = torch.from_numpy(topics_np).to(self.device, dtype=torch.long)
+
         optimizer = torch.optim.LBFGS(
             self.parameters(),
             lr=self.config.lr,
-            max_iter=1,
+            max_iter=self.config.max_iter,          # let LBFGS iterate internally
             history_size=self.config.history_size,
-            line_search_fn=self.config.line_search_fn
+            line_search_fn=self.config.line_search_fn,
+            tolerance_grad=self.config.tol,
+            tolerance_change=self.config.tol
         )
-        
-        last_loss = float('inf')
 
         def closure():
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             out = self.forward(logits, topics)
-            loss = F.cross_entropy(out, targets)
+            loss = F.cross_entropy(out, targets)   # no regularization
             loss.backward()
             return loss
 
-        for i in range(1, self.config.max_iter + 1):
-            loss = optimizer.step(closure)
-            
-            with torch.no_grad():
-                out = self.forward(logits, topics)
-                ce = F.cross_entropy(out, targets).item()
-                
-            if abs(last_loss - ce) < self.config.tol:
-                if verbose:
-                    print(f"  Converged at iteration {i}, loss: {ce:.6f}")
-                break
-            last_loss = ce
-            
-        if i == self.config.max_iter and verbose:
-            print(f"  Max iterations reached, final loss: {ce:.6f}")
+        final_loss = optimizer.step(closure).item()
+        if verbose:
+            print(f"  LBFGS finished, loss: {final_loss:.6f}")
 
     def predict_logits(self, logits_np, topics_np):
-        logits = torch.from_numpy(logits_np).float().to(self.device)
-        topics = torch.from_numpy(topics_np).long().to(self.device)
+        logits = torch.from_numpy(logits_np).to(self.device, dtype=self.dtype)
+        topics = torch.from_numpy(topics_np).to(self.device, dtype=torch.long)
         with torch.no_grad():
             out = self.forward(logits, topics)
         return out.cpu().numpy()
@@ -399,5 +392,108 @@ def run_mmlu_experiment():
     
     return df_train, df_cv, df_test
 
+
+
+
+###### PLOTS
+
+def nce_from_logits_np(logits, labels):
+    logits = logits - logits.max(axis=1, keepdims=True)
+    probs = np.exp(logits); probs /= probs.sum(axis=1, keepdims=True)
+    probs = np.clip(probs, 1e-12, 1.0)
+    ce = -np.mean(np.log(probs[np.arange(len(labels)), labels]))
+    return ce / math.log(logits.shape[1])
+
+def train_calibrator(train_logits, train_labels, train_topics, n_topics, device,
+                     share_a, share_b, shift_then_scale):
+    cfg = CalibrationConfig(shift_then_scale=shift_then_scale,
+                            share_a=share_a, share_b=share_b,
+                            device=device, dtype=torch.float64,
+                            lr=1.0, max_iter=50, tol=1e-7)
+    calib = TorchCalibrator(cfg, n_topics, 4)
+    calib.fit(train_logits, train_labels, train_topics, verbose=False)
+    return calib
+
+def per_topic_breakdown(test_df, label_encoder, uncal_logits, uncal_labels,
+                        trained_calibs, formula_name):
+    subjects = list(label_encoder.classes_)
+    rows = []
+    for subj in subjects:
+        mask = (test_df['subject'].values == subj)
+        if not mask.any(): 
+            continue
+        logits_s = uncal_logits[mask]
+        labels_s = uncal_labels[mask]
+        topic_id = label_encoder.transform([subj])[0]
+        topics_s = np.full(len(labels_s), topic_id, dtype=np.int64)
+
+        scores = {'Uncalibrated': nce_from_logits_np(logits_s, labels_s)}
+        for name, calib in trained_calibs.items():
+            cal_logits = calib.predict_logits(logits_s, topics_s)
+            scores[name] = nce_from_logits_np(cal_logits, labels_s)
+
+        rows.append({'subject': subj, **scores})
+    df = pd.DataFrame(rows).sort_values('subject').reset_index(drop=True)
+    df.attrs['formula'] = formula_name
+    return df
+
+def plot_topic_bars(df, title, outfile):
+    groups = ['Uncalibrated', 'Global', 'GlobalB_TopicA', 'FullTopic']
+    x = np.arange(len(df)); width = 0.2
+    fig, ax = plt.subplots(figsize=(max(10, len(df)*0.4), 6))
+    for i, g in enumerate(groups):
+        ax.bar(x + (i-1.5)*width, df[g].values, width, label=g)
+    ax.set_title(title)
+    ax.set_xticks(x); ax.set_xticklabels(df['subject'].values, rotation=90)
+    ax.set_ylabel('NCE (lower is better)')
+    ax.legend(); fig.tight_layout()
+    plt.savefig(outfile, dpi=180); plt.close(fig)
+
+def run_topic_breakdown(model_name="meta_llama_Llama_3.2_3B_Instruct"):
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    test_df, validation_df = load_mmlu_data(model_name)
+    if test_df is None or validation_df is None:
+        return None, None
+
+    # train on MMLU "test", evaluate on "validation"
+    train_logits, train_labels, train_topics, n_topics, label_encoder = prepare_data(test_df)
+    test_logits, test_labels, _, _, _ = prepare_data(validation_df)
+
+    # (1) a*score + b
+    calibs_linear = {
+        'Global':           train_calibrator(train_logits, train_labels, train_topics, n_topics, device, True,  True,  False),
+        'GlobalB_TopicA':   train_calibrator(train_logits, train_labels, train_topics, n_topics, device, False, True,  False),
+        'FullTopic':        train_calibrator(train_logits, train_labels, train_topics, n_topics, device, False, False, False),
+    }
+    df_linear = per_topic_breakdown(validation_df, label_encoder, test_logits, test_labels,
+                                    calibs_linear, 'a*score+b')
+    plot_topic_bars(df_linear, 'Per-topic NCE: a*score+b', 'nce_by_topic_linear.png')
+
+    # (2) a*(score + b)
+    calibs_shift = {
+        'Global':           train_calibrator(train_logits, train_labels, train_topics, n_topics, device, True,  True,  True),
+        'GlobalB_TopicA':   train_calibrator(train_logits, train_labels, train_topics, n_topics, device, False, True,  True),
+        'FullTopic':        train_calibrator(train_logits, train_labels, train_topics, n_topics, device, False, False, True),
+    }
+    df_shift = per_topic_breakdown(validation_df, label_encoder, test_logits, test_labels,
+                                   calibs_shift, 'a*(score+b)')
+    plot_topic_bars(df_shift, 'Per-topic NCE: a*(score+b)', 'nce_by_topic_shift.png')
+
+    # Print a quick summary focused on your hypothesis
+    focus = df_shift[['subject', 'Uncalibrated', 'Global', 'GlobalB_TopicA', 'FullTopic']]
+    print("\na*(score+b): per-topic NCE (lower is better)")
+    print(focus.to_string(index=False, float_format='%.4f'))
+
+    return df_linear, df_shift
+
+
 if __name__ == "__main__":
+    train_results, cv_results, test_results = run_mmlu_experiment()
+    # Per-topic figures + table:
+    _df_lin, _df_shift = run_topic_breakdown()
+
+
+
+
+
     train_results, cv_results, test_results = run_mmlu_experiment()
