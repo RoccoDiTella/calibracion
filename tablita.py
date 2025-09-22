@@ -373,16 +373,26 @@ def run_mmlu_experiment():
         )
         linear_calibrator = TorchCalibrator(linear_config, n_topics, 4)
         linear_calibrator.fit(train_logits, train_labels, train_topics, verbose=True)
-        lin_train_ce = cross_entropy_from_logits_np(linear_calibrator.predict_logits(train_logits, train_topics), train_labels)
+        lin_logits = linear_calibrator.predict_logits(train_logits, train_topics)
+        lin_train_ce = cross_entropy_from_logits_np(lin_logits, train_labels)
         print(f"    train CE (a*logit+b): {train_uncal_ce:.6f} → {lin_train_ce:.6f}")
-        zero_scale_ce_lin = cross_entropy_from_logits_np(
-            linear_calibrator.predict_zero_scale_logits(train_logits, train_topics),
+        zero_scale_ce_lin, zero_warnings_lin = zero_scale_analysis(
+            linear_calibrator,
+            train_logits,
+            train_topics,
             train_labels,
+            label_encoder,
+            calibrated_logits=lin_logits,
         )
         msg = "    zero-scale CE (a=0): " + f"{zero_scale_ce_lin:.6f}"
-        if zero_scale_ce_lin + 1e-9 < lin_train_ce:
-            msg += "  [warn better than trained scale]"
+        if zero_warnings_lin:
+            msg += "  [warn topic-level improvements detected]"
         print(msg)
+        for topic_id, subject, ce_cal, ce_zero in zero_warnings_lin:
+            label_str = f" ({subject})" if subject is not None else ""
+            print(
+                f"      topic {int(topic_id)}{label_str}: zero-scale {ce_zero:.6f} < calibrated {ce_cal:.6f}"
+            )
         _, _, linear_nce = evaluate_performance(train_logits, train_labels, train_topics, linear_calibrator)
         
         # Shift-scale calibration
@@ -391,16 +401,26 @@ def run_mmlu_experiment():
         )
         shift_calibrator = TorchCalibrator(shift_config, n_topics, 4)
         shift_calibrator.fit(train_logits, train_labels, train_topics, verbose=True)
-        shift_train_ce = cross_entropy_from_logits_np(shift_calibrator.predict_logits(train_logits, train_topics), train_labels)
+        shift_logits = shift_calibrator.predict_logits(train_logits, train_topics)
+        shift_train_ce = cross_entropy_from_logits_np(shift_logits, train_labels)
         print(f"    train CE (a*(logit+b)): {train_uncal_ce:.6f} → {shift_train_ce:.6f}")
-        zero_scale_ce_shift = cross_entropy_from_logits_np(
-            shift_calibrator.predict_zero_scale_logits(train_logits, train_topics),
+        zero_scale_ce_shift, zero_warnings_shift = zero_scale_analysis(
+            shift_calibrator,
+            train_logits,
+            train_topics,
             train_labels,
+            label_encoder,
+            calibrated_logits=shift_logits,
         )
         msg_shift = "    zero-scale CE (a=0): " + f"{zero_scale_ce_shift:.6f}"
-        if zero_scale_ce_shift + 1e-9 < shift_train_ce:
-            msg_shift += "  [warn better than trained scale]"
+        if zero_warnings_shift:
+            msg_shift += "  [warn topic-level improvements detected]"
         print(msg_shift)
+        for topic_id, subject, ce_cal, ce_zero in zero_warnings_shift:
+            label_str = f" ({subject})" if subject is not None else ""
+            print(
+                f"      topic {int(topic_id)}{label_str}: zero-scale {ce_zero:.6f} < calibrated {ce_cal:.6f}"
+            )
         _, _, shift_nce = evaluate_performance(train_logits, train_labels, train_topics, shift_calibrator)
         
         full_train_results.append({
@@ -488,6 +508,33 @@ def cross_entropy_from_logits_np(logits, labels):
 def nce_from_logits_np(logits, labels):
     ce = cross_entropy_from_logits_np(logits, labels)
     return ce / math.log(logits.shape[1])
+
+
+def zero_scale_analysis(calibrator, logits, topics, labels, label_encoder, calibrated_logits=None, eps=1e-9):
+    if calibrated_logits is None:
+        calibrated_logits = calibrator.predict_logits(logits, topics)
+
+    zero_logits = calibrator.predict_zero_scale_logits(logits, topics)
+    zero_ce = cross_entropy_from_logits_np(zero_logits, labels)
+
+    warnings = []
+    unique_topics = np.unique(topics)
+    for topic_id in unique_topics:
+        mask = (topics == topic_id)
+        if mask.sum() == 0:
+            continue
+        ce_calibrated = cross_entropy_from_logits_np(calibrated_logits[mask], labels[mask])
+        ce_zero = cross_entropy_from_logits_np(zero_logits[mask], labels[mask])
+        if ce_zero + eps < ce_calibrated:
+            subject = None
+            if label_encoder is not None and 0 <= topic_id < len(label_encoder.classes_):
+                try:
+                    subject = label_encoder.inverse_transform([topic_id])[0]
+                except Exception:
+                    subject = None
+            warnings.append((topic_id, subject, ce_calibrated, ce_zero))
+
+    return zero_ce, warnings
 
 def train_calibrator(train_logits, train_labels, train_topics, n_topics, device,
                      share_a, share_b, shift_then_scale):
