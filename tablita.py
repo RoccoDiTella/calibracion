@@ -70,6 +70,9 @@ class TorchCalibrator(nn.Module):
         self.to(device=device, dtype=torch.float64)
 
         with torch.no_grad():
+            initial_loss = F.cross_entropy(self.forward(logits, topics), targets).item()
+
+        with torch.no_grad():
             p0 = torch.cat([p.detach().flatten().clone() for p in self.parameters()])
 
         optimizer = torch.optim.LBFGS(
@@ -96,16 +99,30 @@ class TorchCalibrator(nn.Module):
 
         final_loss_returned = optimizer.step(closure)
 
+        optimizer.zero_grad(set_to_none=True)
+        out_final = self.forward(logits, topics)
+        final_loss_tensor = F.cross_entropy(out_final, targets)
+        final_loss_eval = final_loss_tensor.item()
+        final_loss_tensor.backward()
+        grad_norm = torch.sqrt(sum((p.grad.detach() ** 2).sum() for p in self.parameters() if p.grad is not None)).item()
+        optimizer.zero_grad(set_to_none=True)
+
         with torch.no_grad():
-            out = self.forward(logits, topics)
-            final_loss_eval = F.cross_entropy(out, targets).item()
             p1 = torch.cat([p.detach().flatten() for p in self.parameters()])
             delta = p1 - p0
             dnorm = delta.norm().item()
 
         if verbose:
             returned = final_loss_returned.item() if isinstance(final_loss_returned, torch.Tensor) else float(final_loss_returned)
-            print(f"  LBFGS finished, loss: {final_loss_eval:.6f}, returned: {returned:.6f}, ||Δparam||={dnorm:.3e}, closures={it['k']}")
+            improvement = initial_loss - final_loss_eval
+            grad_tol = max(self.config.tol, 1e-9)
+            param_tol = max(self.config.tol, 1e-9)
+            loss_tol = max(self.config.tol, 1e-9)
+            converged = (grad_norm <= grad_tol) or (dnorm <= param_tol and abs(improvement) <= loss_tol)
+            print(
+                f"  LBFGS finished, loss: {final_loss_eval:.6f}, returned: {returned:.6f}, ||Δparam||={dnorm:.3e}, "
+                f"Δloss={improvement:.3e}, final||grad||={grad_norm:.3e}, closures={it['k']}, converged={converged}"
+            )
 
         self.device = device
         self.dtype = torch.float64
@@ -118,6 +135,24 @@ class TorchCalibrator(nn.Module):
         with torch.no_grad():
             out = self.forward(logits, topics)
         return out.cpu().numpy()
+
+    def predict_zero_scale_logits(self, logits_np, topics_np):
+        device = getattr(self, 'device', torch.device(self.config.device))
+        dtype = getattr(self, 'dtype', self.config.dtype)
+        logits = torch.from_numpy(logits_np).to(device=device, dtype=dtype)
+        topics = torch.from_numpy(topics_np).to(device=device, dtype=torch.long)
+
+        with torch.no_grad():
+            if self.config.share_b:
+                bias = self.b.unsqueeze(0).expand(logits.shape[0], -1)
+            else:
+                bias = self.b[topics]
+
+            if self.config.shift_then_scale:
+                zeros = torch.zeros_like(logits)
+                return zeros.cpu().numpy()
+            else:
+                return bias.cpu().numpy()
 
 def load_mmlu_data(model_name="meta_llama_Llama_3.2_3B_Instruct"):
     """Load MMLU data from saved CSV files"""
@@ -340,6 +375,14 @@ def run_mmlu_experiment():
         linear_calibrator.fit(train_logits, train_labels, train_topics, verbose=True)
         lin_train_ce = cross_entropy_from_logits_np(linear_calibrator.predict_logits(train_logits, train_topics), train_labels)
         print(f"    train CE (a*logit+b): {train_uncal_ce:.6f} → {lin_train_ce:.6f}")
+        zero_scale_ce_lin = cross_entropy_from_logits_np(
+            linear_calibrator.predict_zero_scale_logits(train_logits, train_topics),
+            train_labels,
+        )
+        msg = "    zero-scale CE (a=0): " + f"{zero_scale_ce_lin:.6f}"
+        if zero_scale_ce_lin + 1e-9 < lin_train_ce:
+            msg += "  [warn better than trained scale]"
+        print(msg)
         _, _, linear_nce = evaluate_performance(train_logits, train_labels, train_topics, linear_calibrator)
         
         # Shift-scale calibration
@@ -350,6 +393,14 @@ def run_mmlu_experiment():
         shift_calibrator.fit(train_logits, train_labels, train_topics, verbose=True)
         shift_train_ce = cross_entropy_from_logits_np(shift_calibrator.predict_logits(train_logits, train_topics), train_labels)
         print(f"    train CE (a*(logit+b)): {train_uncal_ce:.6f} → {shift_train_ce:.6f}")
+        zero_scale_ce_shift = cross_entropy_from_logits_np(
+            shift_calibrator.predict_zero_scale_logits(train_logits, train_topics),
+            train_labels,
+        )
+        msg_shift = "    zero-scale CE (a=0): " + f"{zero_scale_ce_shift:.6f}"
+        if zero_scale_ce_shift + 1e-9 < shift_train_ce:
+            msg_shift += "  [warn better than trained scale]"
+        print(msg_shift)
         _, _, shift_nce = evaluate_performance(train_logits, train_labels, train_topics, shift_calibrator)
         
         full_train_results.append({
