@@ -456,7 +456,18 @@ def run_mmlu_experiment():
                 f"      topic {int(topic_id)}{label_str}: zero-scale {ce_zero:.6f} < calibrated {ce_cal:.6f}"
             )
         _, _, linear_nce = evaluate_performance(train_logits, train_labels, train_topics, linear_calibrator)
-        
+        if not shared_a and not shared_b:
+            compare_per_topic_reference(
+                linear_calibrator,
+                train_logits,
+                train_labels,
+                train_topics,
+                label_encoder,
+                shift_then_scale=False,
+                fallback_steps=linear_config.fallback_adam_steps,
+                verbose=True,
+            )
+
         # Shift-scale calibration
         shift_config = CalibrationConfig(
             shift_then_scale=True, share_a=shared_a, share_b=shared_b, device=device,
@@ -485,6 +496,17 @@ def run_mmlu_experiment():
                 f"      topic {int(topic_id)}{label_str}: zero-scale {ce_zero:.6f} < calibrated {ce_cal:.6f}"
             )
         _, _, shift_nce = evaluate_performance(train_logits, train_labels, train_topics, shift_calibrator)
+        if not shared_a and not shared_b:
+            compare_per_topic_reference(
+                shift_calibrator,
+                train_logits,
+                train_labels,
+                train_topics,
+                label_encoder,
+                shift_then_scale=True,
+                fallback_steps=shift_config.fallback_adam_steps,
+                verbose=True,
+            )
         
         full_train_results.append({
             'Configuration': f"{config_name}, {b_name}",
@@ -600,6 +622,73 @@ def zero_scale_analysis(calibrator, logits, topics, labels, label_encoder, calib
             warnings.append((topic_id, subject, ce_calibrated, ce_zero))
 
     return zero_ce, warnings
+
+
+def fit_topic_reference(logits, labels, shift_then_scale, fallback_steps):
+    n_classes = logits.shape[1]
+    cfg = CalibrationConfig(
+        shift_then_scale=shift_then_scale,
+        share_a=False,
+        share_b=False,
+        device='cpu',
+        dtype=torch.float64,
+        lr=1.0,
+        max_iter=50,
+        tol=1e-7,
+        fallback_adam_steps=fallback_steps,
+    )
+    calib = TorchCalibrator(cfg, 1, n_classes)
+    topics_zero = np.zeros(len(labels), dtype=np.int64)
+    calib.fit(logits, labels, topics_zero, verbose=False)
+    with torch.no_grad():
+        a_val = torch.exp(calib.loga.detach()).cpu().numpy()[0]
+        b_val = calib.b.detach().cpu().numpy()[0]
+    return a_val, b_val
+
+
+def compare_per_topic_reference(calibrator, logits, labels, topics, label_encoder, shift_then_scale, fallback_steps=25, verbose=True):
+    if calibrator.config.share_a or calibrator.config.share_b:
+        return
+
+    with torch.no_grad():
+        global_a = torch.exp(calibrator.loga.detach()).cpu().numpy()
+        global_b = calibrator.b.detach().cpu().numpy()
+
+    diffs = []
+    for topic_id in np.unique(topics):
+        mask = (topics == topic_id)
+        if mask.sum() == 0:
+            continue
+        ref_a, ref_b = fit_topic_reference(logits[mask], labels[mask], shift_then_scale, fallback_steps)
+        da = ref_a - global_a[topic_id]
+        db = ref_b - global_b[topic_id]
+        diffs.append((topic_id, da, db, ref_a, ref_b, global_a[topic_id], global_b[topic_id]))
+
+    if not diffs or not verbose:
+        return diffs
+
+    max_da = max(abs(d[1]) for d in diffs)
+    max_db = max(np.max(np.abs(d[2])) for d in diffs)
+    print(f"    per-topic reference check: max|Δa|={max_da:.3e}, max|Δb|={max_db:.3e}")
+    tol = 1e-4
+    for topic_id, da, db, ref_a, ref_b, glob_a, glob_b in diffs:
+        if abs(da) > tol or np.any(np.abs(db) > tol):
+            subject = None
+            if label_encoder is not None and 0 <= topic_id < len(label_encoder.classes_):
+                try:
+                    subject = label_encoder.inverse_transform([topic_id])[0]
+                except Exception:
+                    subject = None
+            label_str = f" ({subject})" if subject is not None else ""
+            print(
+                f"      topic {int(topic_id)}{label_str}: ref a={ref_a:.6f}, global a={glob_a:.6f}, Δa={da:+.3e}"
+            )
+            print(
+                "          ref b=" + np.array2string(ref_b, formatter={'float_kind':lambda x: f"{x:.6f}"}) +
+                ", global b=" + np.array2string(glob_b, formatter={'float_kind':lambda x: f"{x:.6f}"}) +
+                ", Δb=" + np.array2string(db, formatter={'float_kind':lambda x: f"{x:+.3e}"})
+            )
+    return diffs
 
 def train_calibrator(train_logits, train_labels, train_topics, n_topics, device,
                      share_a, share_b, shift_then_scale):
