@@ -646,47 +646,71 @@ def fit_topic_reference(logits, labels, shift_then_scale, fallback_steps):
     return a_val, b_val
 
 
-def compare_per_topic_reference(calibrator, logits, labels, topics, label_encoder, shift_then_scale, fallback_steps=25, verbose=True):
+def compare_per_topic_reference(calibrator, logits, labels, topics, label_encoder, shift_then_scale,
+                                fallback_steps=25, verbose=True, tol=5e-4, save_path=None):
     if calibrator.config.share_a or calibrator.config.share_b:
-        return
+        return None
 
     with torch.no_grad():
         global_a = torch.exp(calibrator.loga.detach()).cpu().numpy()
         global_b = calibrator.b.detach().cpu().numpy()
 
-    diffs = []
-    for topic_id in np.unique(topics):
+    records = []
+    unique_topics = np.unique(topics)
+    for topic_id in np.sort(unique_topics):
         mask = (topics == topic_id)
         if mask.sum() == 0:
             continue
         ref_a, ref_b = fit_topic_reference(logits[mask], labels[mask], shift_then_scale, fallback_steps)
-        da = ref_a - global_a[topic_id]
+        da = float(ref_a - global_a[topic_id])
         db = ref_b - global_b[topic_id]
-        diffs.append((topic_id, da, db, ref_a, ref_b, global_a[topic_id], global_b[topic_id]))
-
-    if not diffs or not verbose:
-        return diffs
-
-    max_da = max(abs(d[1]) for d in diffs)
-    max_db = max(np.max(np.abs(d[2])) for d in diffs)
-    print(f"    per-topic reference check: max|Δa|={max_da:.3e}, max|Δb|={max_db:.3e}")
-    tol = 5e-4
-    max_abs_db = max(np.max(np.abs(d[2])) for d in diffs)
-    for topic_id, da, db, ref_a, ref_b, glob_a, glob_b in diffs:
-        if abs(da) <= tol and np.all(np.abs(db) <= tol):
-            continue
         subject = None
         if label_encoder is not None and 0 <= topic_id < len(label_encoder.classes_):
             try:
                 subject = label_encoder.inverse_transform([topic_id])[0]
             except Exception:
                 subject = None
-        label_str = f" ({subject})" if subject is not None else ""
+        records.append({
+            'topic_id': int(topic_id),
+            'subject': subject,
+            'delta_a': da,
+            'max_abs_delta_b': float(np.max(np.abs(db))),
+            'ref_a': float(ref_a),
+            'global_a': float(global_a[topic_id]),
+            'ref_b': ref_b.copy(),
+            'global_b': global_b[topic_id].copy(),
+            'delta_b_vec': db,
+        })
+
+    if not records:
+        return None
+
+    df = pd.DataFrame(records)
+    if save_path is not None:
+        detail_df = df.copy()
+        detail_df['delta_b_vec'] = detail_df['delta_b_vec'].apply(lambda x: np.array2string(x, precision=6))
+        detail_df.to_csv(save_path, index=False)
+
+    if verbose:
+        max_da = df['delta_a'].abs().max()
+        max_db = df['max_abs_delta_b'].max()
+        mean_da = df['delta_a'].abs().mean()
+        mean_db = df['max_abs_delta_b'].mean()
         print(
-            f"      topic {int(topic_id)}{label_str}: Δa={da:+.3e} (ref {ref_a:.6f} vs global {glob_a:.6f})"
+            f"    per-topic reference check: max|Δa|={max_da:.3e}, max|Δb|={max_db:.3e}, "
+            f"mean|Δa|={mean_da:.3e}, mean|Δb|={mean_db:.3e}"
         )
-        print("          Δb=" + np.array2string(db, formatter={'float_kind':lambda x: f"{x:+.3e}"}))
-    return diffs
+        issues = df[(df['delta_a'].abs() > tol) | (df['max_abs_delta_b'] > tol)]
+        if issues.empty:
+            print(f"      all topics within tolerance tol={tol:.1e}")
+        else:
+            summary = issues[['topic_id', 'subject', 'delta_a', 'max_abs_delta_b']].copy()
+            summary['subject'] = summary['subject'].fillna('<unknown>')
+            summary['delta_a'] = summary['delta_a'].apply(lambda x: f"{x:+.3e}")
+            summary['max_abs_delta_b'] = summary['max_abs_delta_b'].apply(lambda x: f"{x:.3e}")
+            print("      topics exceeding tolerance:")
+            print(summary.to_string(index=False))
+    return df
 
 def train_calibrator(train_logits, train_labels, train_topics, n_topics, device,
                      share_a, share_b, shift_then_scale):
