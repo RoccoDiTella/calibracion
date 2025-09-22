@@ -472,7 +472,8 @@ def plot_topic_bars(df, title, outfile):
     plt.savefig(outfile, dpi=180); plt.close(fig)
 
 def run_topic_breakdown(model_name="meta_llama_Llama_3.2_3B_Instruct"):
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = 'cpu'
     test_df, validation_df = load_mmlu_data(model_name)
     if test_df is None or validation_df is None:
         return None, None
