@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import GroupKFold
 from sklearn.preprocessing import LabelEncoder
+from torch.nn.utils import parameters_to_vector, vector_to_parameters
 import warnings
 warnings.filterwarnings('ignore')
 import math
@@ -18,7 +19,8 @@ np.random.seed(42)
 class CalibrationConfig:
     def __init__(self, lr=1.0, max_iter=50, tol=1e-7, device='cpu',
                  shift_then_scale=True, share_a=False, share_b=True,
-                 dtype=torch.float64):
+                 dtype=torch.float64, fallback_adam_steps=0,
+                 fallback_adam_lr=5e-2, probe_directions=0, probe_eps=1e-2):
         self.lr = lr
         self.max_iter = max_iter         # internal LBFGS iterations
         self.tol = tol                   # used for LBFGS tolerances
@@ -29,6 +31,10 @@ class CalibrationConfig:
         self.history_size = 100
         self.line_search_fn = None
         self.dtype = dtype
+        self.fallback_adam_steps = fallback_adam_steps
+        self.fallback_adam_lr = fallback_adam_lr
+        self.probe_directions = probe_directions
+        self.probe_eps = probe_eps
 
 # --- 2) TorchCalibrator: carry dtype through parameters
 class TorchCalibrator(nn.Module):
@@ -71,9 +77,7 @@ class TorchCalibrator(nn.Module):
 
         with torch.no_grad():
             initial_loss = F.cross_entropy(self.forward(logits, topics), targets).item()
-
-        with torch.no_grad():
-            p0 = torch.cat([p.detach().flatten().clone() for p in self.parameters()])
+            p0 = parameters_to_vector(self.parameters()).detach().clone()
 
         optimizer = torch.optim.LBFGS(
             self.parameters(),
@@ -87,7 +91,7 @@ class TorchCalibrator(nn.Module):
         it = {'k': 0}
 
         def closure():
-            optimizer.zero_grad(set_to_none=True)
+            self.zero_grad(set_to_none=True)
             out = self.forward(logits, topics)
             loss = F.cross_entropy(out, targets)
             loss.backward()
@@ -99,30 +103,85 @@ class TorchCalibrator(nn.Module):
 
         final_loss_returned = optimizer.step(closure)
 
-        optimizer.zero_grad(set_to_none=True)
-        out_final = self.forward(logits, topics)
-        final_loss_tensor = F.cross_entropy(out_final, targets)
-        final_loss_eval = final_loss_tensor.item()
-        final_loss_tensor.backward()
-        grad_norm = torch.sqrt(sum((p.grad.detach() ** 2).sum() for p in self.parameters() if p.grad is not None)).item()
-        optimizer.zero_grad(set_to_none=True)
+        def loss_and_grad():
+            self.zero_grad(set_to_none=True)
+            out = self.forward(logits, topics)
+            loss_tensor = F.cross_entropy(out, targets)
+            loss_value = loss_tensor.item()
+            loss_tensor.backward()
+            grad_norm_val = torch.sqrt(
+                sum((p.grad.detach() ** 2).sum() for p in self.parameters() if p.grad is not None)
+            ).item()
+            self.zero_grad(set_to_none=True)
+            return loss_value, grad_norm_val
+
+        final_loss_eval, grad_norm = loss_and_grad()
+        improvement = initial_loss - final_loss_eval
+
+        fallback_used = False
+        fallback_improv = 0.0
+        fallback_steps = max(int(getattr(self.config, 'fallback_adam_steps', 0)), 0)
+        if ((grad_norm > max(self.config.tol, 1e-9)) or (improvement < 0)) and fallback_steps > 0:
+            fallback_used = True
+            prev_loss = final_loss_eval
+            fallback_opt = torch.optim.Adam(self.parameters(), lr=self.config.fallback_adam_lr)
+            for _ in range(fallback_steps):
+                self.zero_grad(set_to_none=True)
+                loss_tensor = F.cross_entropy(self.forward(logits, topics), targets)
+                loss_tensor.backward()
+                fallback_opt.step()
+            final_loss_eval, grad_norm = loss_and_grad()
+            fallback_improv = prev_loss - final_loss_eval
+            improvement = initial_loss - final_loss_eval
 
         with torch.no_grad():
-            p1 = torch.cat([p.detach().flatten() for p in self.parameters()])
-            delta = p1 - p0
-            dnorm = delta.norm().item()
+            p1 = parameters_to_vector(self.parameters()).detach().clone()
+        delta_vec = p1 - p0
+        dnorm = delta_vec.norm().item()
+
+        grad_tol = max(self.config.tol, 1e-9)
+        param_tol = max(self.config.tol, 1e-9)
+        loss_tol = max(self.config.tol, 1e-9)
+        converged = (grad_norm <= grad_tol) or (dnorm <= param_tol and abs(improvement) <= loss_tol)
+
+        probe_reports = []
+        probe_count = max(int(getattr(self.config, 'probe_directions', 0)), 0)
+        probe_eps = float(getattr(self.config, 'probe_eps', 1e-2))
+        if verbose and probe_count > 0:
+            with torch.no_grad():
+                params_vec = p1.clone()
+                base_loss = final_loss_eval
+                scale = probe_eps * max(params_vec.norm().item(), 1.0)
+                if scale == 0:
+                    scale = probe_eps
+                for i in range(probe_count):
+                    direction = torch.randn_like(params_vec)
+                    dir_norm = direction.norm()
+                    if dir_norm == 0:
+                        continue
+                    direction = direction / dir_norm
+                    deltas = {}
+                    for sign, label in ((-1, '-') , (1, '+')):
+                        candidate = params_vec + sign * scale * direction
+                        vector_to_parameters(candidate, self.parameters())
+                        loss_val = F.cross_entropy(self.forward(logits, topics), targets).item()
+                        deltas[label] = loss_val - base_loss
+                    vector_to_parameters(params_vec, self.parameters())
+                    probe_reports.append(deltas)
 
         if verbose:
             returned = final_loss_returned.item() if isinstance(final_loss_returned, torch.Tensor) else float(final_loss_returned)
-            improvement = initial_loss - final_loss_eval
-            grad_tol = max(self.config.tol, 1e-9)
-            param_tol = max(self.config.tol, 1e-9)
-            loss_tol = max(self.config.tol, 1e-9)
-            converged = (grad_norm <= grad_tol) or (dnorm <= param_tol and abs(improvement) <= loss_tol)
             print(
                 f"  LBFGS finished, loss: {final_loss_eval:.6f}, returned: {returned:.6f}, ||Δparam||={dnorm:.3e}, "
                 f"Δloss={improvement:.3e}, final||grad||={grad_norm:.3e}, closures={it['k']}, converged={converged}"
             )
+            if fallback_used:
+                print(f"    fallback Adam: Δloss={fallback_improv:.3e}, steps={fallback_steps}, final||grad||={grad_norm:.3e}")
+            if probe_reports:
+                for idx, deltas in enumerate(probe_reports):
+                    minus = deltas.get('-', float('nan'))
+                    plus = deltas.get('+', float('nan'))
+                    print(f"    probe {idx}: Δloss[-ε]={minus:+.3e}, Δloss[+ε]={plus:+.3e}")
 
         self.device = device
         self.dtype = torch.float64
@@ -291,7 +350,8 @@ def run_calibration_cv(logits, labels, topics, n_topics, device='cpu', n_folds=5
             uncal_nces.append(nce_from_logits_np(val_logits, val_labels))
 
             linear_config = CalibrationConfig(
-                shift_then_scale=False, share_a=shared_a, share_b=shared_b, device=device
+                shift_then_scale=False, share_a=shared_a, share_b=shared_b, device=device,
+                fallback_adam_steps=10
             )
             linear_calibrator = TorchCalibrator(linear_config, n_topics, 4)
             linear_calibrator.fit(train_logits, train_labels, train_topics)
@@ -299,7 +359,8 @@ def run_calibration_cv(logits, labels, topics, n_topics, device='cpu', n_folds=5
             linear_nces.append(linear_nce)
 
             shift_config = CalibrationConfig(
-                shift_then_scale=True, share_a=shared_a, share_b=shared_b, device=device
+                shift_then_scale=True, share_a=shared_a, share_b=shared_b, device=device,
+                fallback_adam_steps=10
             )
             shift_calibrator = TorchCalibrator(shift_config, n_topics, 4)
             shift_calibrator.fit(train_logits, train_labels, train_topics)
@@ -369,7 +430,8 @@ def run_mmlu_experiment():
     for config_name, b_name, shared_a, shared_b in configs:
         # Linear calibration
         linear_config = CalibrationConfig(
-            shift_then_scale=False, share_a=shared_a, share_b=shared_b, device=device
+            shift_then_scale=False, share_a=shared_a, share_b=shared_b, device=device,
+            fallback_adam_steps=25, probe_directions=3
         )
         linear_calibrator = TorchCalibrator(linear_config, n_topics, 4)
         linear_calibrator.fit(train_logits, train_labels, train_topics, verbose=True)
@@ -397,7 +459,8 @@ def run_mmlu_experiment():
         
         # Shift-scale calibration
         shift_config = CalibrationConfig(
-            shift_then_scale=True, share_a=shared_a, share_b=shared_b, device=device
+            shift_then_scale=True, share_a=shared_a, share_b=shared_b, device=device,
+            fallback_adam_steps=25, probe_directions=3
         )
         shift_calibrator = TorchCalibrator(shift_config, n_topics, 4)
         shift_calibrator.fit(train_logits, train_labels, train_topics, verbose=True)
@@ -441,14 +504,16 @@ def run_mmlu_experiment():
     for config_name, b_name, shared_a, shared_b in configs:
         # Train on full training set, evaluate on test
         linear_config = CalibrationConfig(
-            shift_then_scale=False, share_a=shared_a, share_b=shared_b, device=device
+            shift_then_scale=False, share_a=shared_a, share_b=shared_b, device=device,
+            fallback_adam_steps=25
         )
         linear_calibrator = TorchCalibrator(linear_config, n_topics, 4)
         linear_calibrator.fit(train_logits, train_labels, train_topics)
         _, _, linear_test_nce = evaluate_performance(test_logits, test_labels, test_topics, linear_calibrator)
         
         shift_config = CalibrationConfig(
-            shift_then_scale=True, share_a=shared_a, share_b=shared_b, device=device
+            shift_then_scale=True, share_a=shared_a, share_b=shared_b, device=device,
+            fallback_adam_steps=25
         )
         shift_calibrator = TorchCalibrator(shift_config, n_topics, 4)
         shift_calibrator.fit(train_logits, train_labels, train_topics)
@@ -541,7 +606,8 @@ def train_calibrator(train_logits, train_labels, train_topics, n_topics, device,
     cfg = CalibrationConfig(shift_then_scale=shift_then_scale,
                             share_a=share_a, share_b=share_b,
                             device=device, dtype=torch.float64,
-                            lr=1.0, max_iter=50, tol=1e-7)
+                            lr=1.0, max_iter=50, tol=1e-7,
+                            fallback_adam_steps=10)
     calib = TorchCalibrator(cfg, n_topics, 4)
     calib.fit(train_logits, train_labels, train_topics, verbose=False)
     return calib
