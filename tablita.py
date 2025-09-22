@@ -198,7 +198,7 @@ def calculate_uncalibrated_performance(logits, labels):
     
     return accuracy, ce_loss, nce
 
-def run_calibration_cv(logits, labels, topics, n_topics, device='cuda', n_folds=5):
+def run_calibration_cv(logits, labels, topics, n_topics, device='cpu', n_folds=5):
     """Run cross-validation calibration experiment"""
     
     # Test configurations
@@ -280,7 +280,8 @@ def run_calibration_cv(logits, labels, topics, n_topics, device='cuda', n_folds=
 
 def run_mmlu_experiment():
     """Run the complete MMLU calibration experiment"""
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = 'cpu'
     print(f"Using device: {device}")
     
     # Load MMLU data
