@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import KFold
+from sklearn.model_selection import GroupKFold
 from sklearn.preprocessing import LabelEncoder
 import warnings
 warnings.filterwarnings('ignore')
@@ -27,7 +27,7 @@ class CalibrationConfig:
         self.share_a = share_a
         self.share_b = share_b
         self.history_size = 100
-        self.line_search_fn = 'strong_wolfe'
+        self.line_search_fn = None
         self.dtype = dtype
 
 # --- 2) TorchCalibrator: carry dtype through parameters
@@ -62,56 +62,59 @@ class TorchCalibrator(nn.Module):
         return (logits + b_per) * scales if self.config.shift_then_scale else logits * scales + b_per
 
     def fit(self, logits_np, targets_np, topics_np, verbose=False):
-        # Full-batch, double precision on CPU is most robust for LBFGS on tiny param sets
-        device = torch.device('cpu')  # <= force CPU for LBFGS stability
+        device = torch.device('cpu')
         logits = torch.from_numpy(logits_np).to(device=device, dtype=torch.float64)
         targets = torch.from_numpy(targets_np).to(device=device, dtype=torch.long)
-        topics  = torch.from_numpy(topics_np).to(device=device, dtype=torch.long)
+        topics = torch.from_numpy(topics_np).to(device=device, dtype=torch.long)
 
-        # also move params to CPU/double once
         self.to(device=device, dtype=torch.float64)
 
-        # Keep a copy to measure Δparam
         with torch.no_grad():
             p0 = torch.cat([p.detach().flatten().clone() for p in self.parameters()])
 
         optimizer = torch.optim.LBFGS(
             self.parameters(),
-            lr=self.config.lr if hasattr(self.config, 'lr') else 1.0,
-            max_iter=self.config.max_iter if hasattr(self.config, 'max_iter') else 50,
-            history_size=self.config.history_size if hasattr(self.config, 'history_size') else 100,
-            # Remove strong_wolfe; default line search tends to be less finicky here
-            # line_search_fn=None  # default
-            tolerance_grad=self.config.tol if hasattr(self.config, 'tol') else 1e-7,
-            tolerance_change=self.config.tol if hasattr(self.config, 'tol') else 1e-7,
+            lr=self.config.lr,
+            max_iter=self.config.max_iter,
+            history_size=self.config.history_size,
+            tolerance_grad=self.config.tol,
+            tolerance_change=self.config.tol,
         )
 
-        it = {'k': 0}  # small mutable to count closures
+        it = {'k': 0}
 
         def closure():
             optimizer.zero_grad(set_to_none=True)
             out = self.forward(logits, topics)
-            loss = F.cross_entropy(out, targets)  # no regularization
+            loss = F.cross_entropy(out, targets)
             loss.backward()
-            if verbose and it['k'] in (0, 1):  # print gradient norms at first few closures
-                gnorm = torch.sqrt(sum((p.grad.detach()**2).sum() for p in self.parameters() if p.grad is not None)).item()
+            if verbose and it['k'] in (0, 1):
+                gnorm = torch.sqrt(sum((p.grad.detach() ** 2).sum() for p in self.parameters() if p.grad is not None)).item()
                 print(f"    closure {it['k']}: loss={loss.item():.6f}, ||grad||={gnorm:.3e}")
             it['k'] += 1
             return loss
 
-        final_loss = optimizer.step(closure).item()
+        final_loss_returned = optimizer.step(closure)
 
-        # Report parameter movement
         with torch.no_grad():
+            out = self.forward(logits, topics)
+            final_loss_eval = F.cross_entropy(out, targets).item()
             p1 = torch.cat([p.detach().flatten() for p in self.parameters()])
-            delta = (p1 - p0)
+            delta = p1 - p0
             dnorm = delta.norm().item()
-            if verbose:
-                print(f"  LBFGS finished, loss: {final_loss:.6f}, ||Δparam||={dnorm:.3e}")
+
+        if verbose:
+            returned = final_loss_returned.item() if isinstance(final_loss_returned, torch.Tensor) else float(final_loss_returned)
+            print(f"  LBFGS finished, loss: {final_loss_eval:.6f}, returned: {returned:.6f}, ||Δparam||={dnorm:.3e}, closures={it['k']}")
+
+        self.device = device
+        self.dtype = torch.float64
 
     def predict_logits(self, logits_np, topics_np):
-        logits = torch.from_numpy(logits_np).to(self.device, dtype=self.dtype)
-        topics = torch.from_numpy(topics_np).to(self.device, dtype=torch.long)
+        device = getattr(self, 'device', torch.device(self.config.device))
+        dtype = getattr(self, 'dtype', self.config.dtype)
+        logits = torch.from_numpy(logits_np).to(device=device, dtype=dtype)
+        topics = torch.from_numpy(topics_np).to(device=device, dtype=torch.long)
         with torch.no_grad():
             out = self.forward(logits, topics)
         return out.cpu().numpy()
@@ -138,28 +141,38 @@ def load_mmlu_data(model_name="meta_llama_Llama_3.2_3B_Instruct"):
         print("Make sure you have run forward.py with Llama 3.2 3B Instruct first")
         return None, None
 
-def prepare_data(df):
+def prepare_data(df, label_encoder=None, fit_encoder=True):
     """Prepare data for calibration"""
-    # Extract logits
     logit_cols = ['logit_A', 'logit_B', 'logit_C', 'logit_D']
     logits = df[logit_cols].values
-    
-    # Extract labels
     labels = df['correct_answer_position'].values
-    
-    # Encode subjects as topic indices
-    label_encoder = LabelEncoder()
-    topics = label_encoder.fit_transform(df['subject'].values)
-    
-    # Get unique subjects for reporting
-    unique_subjects = df['subject'].nunique()
-    
-    print(f"Data preparation:")
+    question_ids = df['question_id'].values if 'question_id' in df.columns else None
+    subjects = df['subject'].values
+
+    if fit_encoder:
+        label_encoder = LabelEncoder()
+        topics = label_encoder.fit_transform(subjects)
+    else:
+        if label_encoder is None:
+            raise ValueError("label_encoder must be provided when fit_encoder is False")
+        try:
+            topics = label_encoder.transform(subjects)
+        except ValueError:
+            mapping = {s: i for i, s in enumerate(label_encoder.classes_)}
+            fallback_id = 0
+            unseen = sorted(set(subjects) - set(label_encoder.classes_))
+            if unseen:
+                print(f"[warn] {len(unseen)} unseen subject(s) in this split; falling back to topic {fallback_id}")
+            topics = np.array([mapping.get(s, fallback_id) for s in subjects], dtype=np.int64)
+
+    unique_subjects = len(np.unique(subjects))
+
+    print("Data preparation:")
     print(f"  Samples: {len(logits)}")
     print(f"  Unique subjects: {unique_subjects}")
     print(f"  Logits shape: {logits.shape}")
-    
-    return logits, labels, topics, unique_subjects, label_encoder
+
+    return logits, labels, topics, unique_subjects, label_encoder, question_ids
 
 def evaluate_performance(logits, labels, topics, calibrator):
     """Evaluate calibration performance with NCE"""
@@ -198,52 +211,50 @@ def calculate_uncalibrated_performance(logits, labels):
     
     return accuracy, ce_loss, nce
 
-def run_calibration_cv(logits, labels, topics, n_topics, device='cpu', n_folds=5):
-    """Run cross-validation calibration experiment"""
-    
-    # Test configurations
+def run_calibration_cv(logits, labels, topics, n_topics, device='cpu', n_folds=5, question_ids=None):
+    """Run cross-validation calibration experiment grouped by question id"""
+
     configs = [
         ('a_shared', 'b_shared', True, True),
         ('a_topic', 'b_shared', False, True),
         ('a_topic', 'b_topic', False, False),
     ]
-    
-    # Get unique question IDs to split by questions, not permutations
-    # Assume every 24 rows is one question (24 permutations)
-    n_samples = len(logits)
-    n_questions = n_samples // 24
-    question_ids = np.repeat(np.arange(n_questions), 24)
-    
-    unique_questions = np.unique(question_ids)
-    
+
+    if question_ids is None:
+        if len(logits) % 24 != 0:
+            raise ValueError("Question ids required when rows per question are not 24")
+        question_ids = np.repeat(np.arange(len(logits) // 24), 24)
+
+    question_ids = np.asarray(question_ids)
+
+    splitter = GroupKFold(n_splits=n_folds)
     cv_results = []
-    
-    # Cross-validation
-    kfold = KFold(n_splits=n_folds, shuffle=True, random_state=42)
-    
+
+    def mean_and_se(values):
+        arr = np.asarray(values, dtype=np.float64)
+        mean = arr.mean()
+        if arr.size <= 1:
+            return mean, 0.0
+        return mean, arr.std(ddof=1) / np.sqrt(arr.size)
+
     for config_name, b_name, shared_a, shared_b in configs:
         print(f"Cross-validation for {config_name}, {b_name}...")
-        
+
+        uncal_nces = []
         linear_nces = []
         shift_nces = []
-        
-        for fold, (train_q_idx, val_q_idx) in enumerate(kfold.split(unique_questions)):
-            train_questions = unique_questions[train_q_idx]
-            val_questions = unique_questions[val_q_idx]
-            
-            # Create masks
-            train_mask = np.isin(question_ids, train_questions)
-            val_mask = np.isin(question_ids, val_questions)
-            
-            train_logits = logits[train_mask]
-            train_labels = labels[train_mask]
-            train_topics = topics[train_mask]
-            
-            val_logits = logits[val_mask]
-            val_labels = labels[val_mask]
-            val_topics = topics[val_mask]
-            
-            # Linear calibration
+
+        for fold, (train_idx, val_idx) in enumerate(splitter.split(logits, labels, groups=question_ids)):
+            train_logits = logits[train_idx]
+            train_labels = labels[train_idx]
+            train_topics = topics[train_idx]
+
+            val_logits = logits[val_idx]
+            val_labels = labels[val_idx]
+            val_topics = topics[val_idx]
+
+            uncal_nces.append(nce_from_logits_np(val_logits, val_labels))
+
             linear_config = CalibrationConfig(
                 shift_then_scale=False, share_a=shared_a, share_b=shared_b, device=device
             )
@@ -251,8 +262,7 @@ def run_calibration_cv(logits, labels, topics, n_topics, device='cpu', n_folds=5
             linear_calibrator.fit(train_logits, train_labels, train_topics)
             _, _, linear_nce = evaluate_performance(val_logits, val_labels, val_topics, linear_calibrator)
             linear_nces.append(linear_nce)
-            
-            # Shift-scale calibration
+
             shift_config = CalibrationConfig(
                 shift_then_scale=True, share_a=shared_a, share_b=shared_b, device=device
             )
@@ -260,22 +270,21 @@ def run_calibration_cv(logits, labels, topics, n_topics, device='cpu', n_folds=5
             shift_calibrator.fit(train_logits, train_labels, train_topics)
             _, _, shift_nce = evaluate_performance(val_logits, val_labels, val_topics, shift_calibrator)
             shift_nces.append(shift_nce)
-        
-        # Calculate means and standard errors
-        linear_mean = np.mean(linear_nces)
-        linear_se = np.std(linear_nces) / np.sqrt(len(linear_nces))
-        
-        shift_mean = np.mean(shift_nces)
-        shift_se = np.std(shift_nces) / np.sqrt(len(shift_nces))
-        
+
+        uncal_mean, uncal_se = mean_and_se(uncal_nces)
+        linear_mean, linear_se = mean_and_se(linear_nces)
+        shift_mean, shift_se = mean_and_se(shift_nces)
+
         cv_results.append({
             'Configuration': f"{config_name}, {b_name}",
+            'Uncal_Mean': uncal_mean,
+            'Uncal_SE': uncal_se,
             'Linear_Mean': linear_mean,
             'Linear_SE': linear_se,
             'Shift_Mean': shift_mean,
             'Shift_SE': shift_se
         })
-    
+
     return cv_results
 
 def run_mmlu_experiment():
@@ -295,12 +304,9 @@ def run_mmlu_experiment():
     
     # Prepare data
     # Use "test" set for training/CV (confusing MMLU naming)
-    train_logits, train_labels, train_topics, n_topics, label_encoder = prepare_data(test_df)
+    train_logits, train_labels, train_topics, n_topics, label_encoder, train_question_ids = prepare_data(test_df)
     # Use "validation" set for final testing
-    test_logits, test_labels, test_topics, _, _ = prepare_data(validation_df)
-    
-    # Ensure test topics use same encoding
-    test_topics_encoded = label_encoder.transform(validation_df['subject'].values)
+    test_logits, test_labels, test_topics, _, _, _ = prepare_data(validation_df, label_encoder=label_encoder, fit_encoder=False)
     
     # Calculate uncalibrated performance
     train_uncal_acc, train_uncal_ce, train_uncal_nce = calculate_uncalibrated_performance(train_logits, train_labels)
@@ -332,6 +338,8 @@ def run_mmlu_experiment():
         )
         linear_calibrator = TorchCalibrator(linear_config, n_topics, 4)
         linear_calibrator.fit(train_logits, train_labels, train_topics, verbose=True)
+        lin_train_ce = cross_entropy_from_logits_np(linear_calibrator.predict_logits(train_logits, train_topics), train_labels)
+        print(f"    train CE (a*logit+b): {train_uncal_ce:.6f} → {lin_train_ce:.6f}")
         _, _, linear_nce = evaluate_performance(train_logits, train_labels, train_topics, linear_calibrator)
         
         # Shift-scale calibration
@@ -340,6 +348,8 @@ def run_mmlu_experiment():
         )
         shift_calibrator = TorchCalibrator(shift_config, n_topics, 4)
         shift_calibrator.fit(train_logits, train_labels, train_topics, verbose=True)
+        shift_train_ce = cross_entropy_from_logits_np(shift_calibrator.predict_logits(train_logits, train_topics), train_labels)
+        print(f"    train CE (a*(logit+b)): {train_uncal_ce:.6f} → {shift_train_ce:.6f}")
         _, _, shift_nce = evaluate_performance(train_logits, train_labels, train_topics, shift_calibrator)
         
         full_train_results.append({
@@ -351,7 +361,7 @@ def run_mmlu_experiment():
     
     # 2. Cross-validation results
     print("\nRunning cross-validation...")
-    cv_results = run_calibration_cv(train_logits, train_labels, train_topics, n_topics, device)
+    cv_results = run_calibration_cv(train_logits, train_labels, train_topics, n_topics, device, question_ids=train_question_ids)
     
     # 3. Final test set results
     print("\nEvaluating on test set...")
@@ -364,14 +374,14 @@ def run_mmlu_experiment():
         )
         linear_calibrator = TorchCalibrator(linear_config, n_topics, 4)
         linear_calibrator.fit(train_logits, train_labels, train_topics)
-        _, _, linear_test_nce = evaluate_performance(test_logits, test_labels, test_topics_encoded, linear_calibrator)
+        _, _, linear_test_nce = evaluate_performance(test_logits, test_labels, test_topics, linear_calibrator)
         
         shift_config = CalibrationConfig(
             shift_then_scale=True, share_a=shared_a, share_b=shared_b, device=device
         )
         shift_calibrator = TorchCalibrator(shift_config, n_topics, 4)
         shift_calibrator.fit(train_logits, train_labels, train_topics)
-        _, _, shift_test_nce = evaluate_performance(test_logits, test_labels, test_topics_encoded, shift_calibrator)
+        _, _, shift_test_nce = evaluate_performance(test_logits, test_labels, test_topics, shift_calibrator)
         
         test_results.append({
             'Configuration': f"{config_name}, {b_name}",
@@ -394,10 +404,10 @@ def run_mmlu_experiment():
     
     # Format CV results
     cv_formatted = []
-    for i, result in enumerate(cv_results):
+    for result in cv_results:
         cv_formatted.append({
             'Configuration': result['Configuration'],
-            'Uncalibrated': f"{train_uncal_nce:.4f}",
+            'Uncalibrated': f"{result['Uncal_Mean']:.4f} ± {result['Uncal_SE']:.4f}",
             'a*logit+b': f"{result['Linear_Mean']:.4f} ± {result['Linear_SE']:.4f}",
             'a*(logit+b)': f"{result['Shift_Mean']:.4f} ± {result['Shift_SE']:.4f}"
         })
@@ -414,16 +424,18 @@ def run_mmlu_experiment():
     
     return df_train, df_cv, df_test
 
-
-
-
 ###### PLOTS
 
-def nce_from_logits_np(logits, labels):
-    logits = logits - logits.max(axis=1, keepdims=True)
-    probs = np.exp(logits); probs /= probs.sum(axis=1, keepdims=True)
+def cross_entropy_from_logits_np(logits, labels):
+    shifted = logits - logits.max(axis=1, keepdims=True)
+    probs = np.exp(shifted)
+    probs /= probs.sum(axis=1, keepdims=True)
     probs = np.clip(probs, 1e-12, 1.0)
-    ce = -np.mean(np.log(probs[np.arange(len(labels)), labels]))
+    return -np.mean(np.log(probs[np.arange(len(labels)), labels]))
+
+
+def nce_from_logits_np(logits, labels):
+    ce = cross_entropy_from_logits_np(logits, labels)
     return ce / math.log(logits.shape[1])
 
 def train_calibrator(train_logits, train_labels, train_topics, n_topics, device,
@@ -479,8 +491,9 @@ def run_topic_breakdown(model_name="meta_llama_Llama_3.2_3B_Instruct"):
         return None, None
 
     # train on MMLU "test", evaluate on "validation"
-    train_logits, train_labels, train_topics, n_topics, label_encoder = prepare_data(test_df)
-    test_logits, test_labels, _, _, _ = prepare_data(validation_df)
+    train_logits, train_labels, train_topics, n_topics, label_encoder, _ = prepare_data(test_df)
+    test_logits = validation_df[['logit_A', 'logit_B', 'logit_C', 'logit_D']].values
+    test_labels = validation_df['correct_answer_position'].values
 
     # (1) a*score + b
     calibs_linear = {
@@ -491,6 +504,7 @@ def run_topic_breakdown(model_name="meta_llama_Llama_3.2_3B_Instruct"):
     df_linear = per_topic_breakdown(validation_df, label_encoder, test_logits, test_labels,
                                     calibs_linear, 'a*score+b')
     plot_topic_bars(df_linear, 'Per-topic NCE: a*score+b', 'nce_by_topic_linear.png')
+    df_linear.to_csv('nce_by_topic_linear.csv', index=False)
 
     # (2) a*(score + b)
     calibs_shift = {
@@ -501,6 +515,7 @@ def run_topic_breakdown(model_name="meta_llama_Llama_3.2_3B_Instruct"):
     df_shift = per_topic_breakdown(validation_df, label_encoder, test_logits, test_labels,
                                    calibs_shift, 'a*(score+b)')
     plot_topic_bars(df_shift, 'Per-topic NCE: a*(score+b)', 'nce_by_topic_shift.png')
+    df_shift.to_csv('nce_by_topic_shift.csv', index=False)
 
     # Print a quick summary focused on your hypothesis
     focus = df_shift[['subject', 'Uncalibrated', 'Global', 'GlobalB_TopicA', 'FullTopic']]
@@ -514,9 +529,3 @@ if __name__ == "__main__":
     train_results, cv_results, test_results = run_mmlu_experiment()
     # Per-topic figures + table:
     _df_lin, _df_shift = run_topic_breakdown()
-
-
-
-
-
-    train_results, cv_results, test_results = run_mmlu_experiment()
