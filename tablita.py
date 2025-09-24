@@ -810,8 +810,11 @@ def run_topic_breakdown(model_name=DEFAULT_MODEL_NAME):
 
     # train on MMLU "test", evaluate on "validation"
     train_logits, train_labels, train_topics, n_topics, label_encoder, _ = prepare_data(test_df)
-    test_logits = validation_df[['logit_A', 'logit_B', 'logit_C', 'logit_D']].values
-    test_labels = validation_df['correct_answer_position'].values
+    test_logits, test_labels, test_topics, _, _, _ = prepare_data(
+        validation_df,
+        label_encoder=label_encoder,
+        fit_encoder=False,
+    )
 
     # (1) a*score + b
     calibs_linear = {
