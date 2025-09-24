@@ -339,6 +339,49 @@ def calculate_uncalibrated_performance(logits, labels):
     
     return accuracy, ce_loss, nce
 
+def _summarize_parameters(calibrator, label_encoder):
+    groups = list(label_encoder.classes_) if label_encoder is not None else []
+    with torch.no_grad():
+        loga = calibrator.loga.detach().cpu().numpy()
+        b_tensor = calibrator.b.detach().cpu().numpy()
+
+    exp_a = np.exp(loga)
+    if calibrator.config.share_a:
+        a_summary = {"global": float(exp_a.reshape(-1)[0])}
+    else:
+        a_summary = {}
+        for idx, value in enumerate(exp_a.reshape(-1)):
+            label = groups[idx] if idx < len(groups) else f"topic_{idx}"
+            a_summary[label] = float(value)
+
+    b_array = np.atleast_2d(b_tensor)
+    if calibrator.config.share_b:
+        b_summary = {"global": [float(x) for x in b_array.reshape(-1)]}
+    else:
+        b_summary = {}
+        for idx, row in enumerate(b_array):
+            label = groups[idx] if idx < len(groups) else f"topic_{idx}"
+            b_summary[label] = [float(x) for x in row]
+
+    return a_summary, b_summary
+
+
+def _print_parameter_summary(prefix, calibrator, label_encoder):
+    a_summary, b_summary = _summarize_parameters(calibrator, label_encoder)
+
+    def fmt_list(values):
+        return "[" + ", ".join(f"{v:.4f}" for v in values) + "]"
+
+    print(f"    {prefix} parameters:")
+    print("      a (scale):")
+    for key, value in a_summary.items():
+        print(f"        {key}: {value:.4f}")
+
+    print("      b (bias):")
+    for key, values in b_summary.items():
+        print(f"        {key}: {fmt_list(values)}")
+
+
 def run_calibration_cv(logits, labels, topics, n_topics, device='cpu', n_folds=5, question_ids=None):
     """Run cross-validation calibration experiment grouped by question id"""
 
@@ -508,6 +551,8 @@ def run_mmlu_experiment(model_name=DEFAULT_MODEL_NAME, reference_report_prefix=N
                 save_path=report_path,
             )
 
+        _print_parameter_summary("Linear a*logit + b", linear_calibrator, label_encoder)
+
         # Shift-scale calibration
         shift_config = CalibrationConfig(
             shift_then_scale=True, share_a=shared_a, share_b=shared_b, device=device,
@@ -552,6 +597,8 @@ def run_mmlu_experiment(model_name=DEFAULT_MODEL_NAME, reference_report_prefix=N
                 verbose=True,
                 save_path=report_path,
             )
+        
+        _print_parameter_summary("Shift-scale a*(logit + b)", shift_calibrator, label_encoder)
         
         full_train_results.append({
             'Configuration': f"{config_name}, {b_name}",
