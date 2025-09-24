@@ -1,3 +1,6 @@
+import argparse
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,6 +19,8 @@ torch.manual_seed(42)
 np.random.seed(42)
 
 # --- 1) Config: add dtype, use saner tolerances, larger history
+DEFAULT_MODEL_NAME = "meta_llama_Llama_3.2_3B_Instruct"
+
 class CalibrationConfig:
     def __init__(self, lr=1.0, max_iter=50, tol=1e-7, device='cpu',
                  shift_then_scale=True, share_a=False, share_b=True,
@@ -235,38 +240,67 @@ def load_mmlu_data(model_name="meta_llama_Llama_3.2_3B_Instruct"):
         print("Make sure you have run forward.py with Llama 3.2 3B Instruct first")
         return None, None
 
-def prepare_data(df, label_encoder=None, fit_encoder=True):
-    """Prepare data for calibration"""
+def prepare_data(df, label_encoder=None, fit_encoder=True, n_difficulty_bins=5):
+    """Prepare data for calibration using question-level difficulty bins."""
+
+    if 'question_id' not in df.columns:
+        raise ValueError("Dataframe must include 'question_id' to compute difficulty bins")
+
     logit_cols = ['logit_A', 'logit_B', 'logit_C', 'logit_D']
     logits = df[logit_cols].values
     labels = df['correct_answer_position'].values
-    question_ids = df['question_id'].values if 'question_id' in df.columns else None
-    subjects = df['subject'].values
+    question_ids = df['question_id'].values
+
+    # Compute per-question accuracy across permutations to build difficulty bins
+    preds = np.argmax(logits, axis=1)
+    correct = (preds == labels).astype(float)
+    acc_df = pd.DataFrame({
+        'question_id': question_ids,
+        'correct': correct,
+    })
+    question_acc = acc_df.groupby('question_id')['correct'].mean()
+
+    # Use quantiles to split into difficulty bins (0 = hardest, n-1 = easiest)
+    unique_values = question_acc.nunique()
+    bins = min(n_difficulty_bins, unique_values if unique_values > 0 else 1)
+    if bins < n_difficulty_bins:
+        print(f"[info] Only {bins} distinct difficulty levels available (requested {n_difficulty_bins})")
+    qcut = pd.qcut(question_acc, q=bins, labels=False, duplicates='drop')
+    qcut = qcut.astype(int)
+    # Ensure contiguous bin indices starting at 0
+    remap = {old: idx for idx, old in enumerate(sorted(qcut.unique()))}
+    bin_series = qcut.map(remap)
+
+    difficulty_ids = np.array([bin_series.loc[qid] for qid in question_ids], dtype=np.int64)
+    difficulty_labels = np.array([f"difficulty_{idx}" for idx in difficulty_ids])
+
+    df.loc[:, 'difficulty_level'] = difficulty_labels
+    df.loc[:, 'question_accuracy'] = [question_acc[qid] for qid in question_ids]
 
     if fit_encoder:
         label_encoder = LabelEncoder()
-        topics = label_encoder.fit_transform(subjects)
+        topics = label_encoder.fit_transform(difficulty_labels)
     else:
         if label_encoder is None:
             raise ValueError("label_encoder must be provided when fit_encoder is False")
         try:
-            topics = label_encoder.transform(subjects)
+            topics = label_encoder.transform(difficulty_labels)
         except ValueError:
             mapping = {s: i for i, s in enumerate(label_encoder.classes_)}
             fallback_id = 0
-            unseen = sorted(set(subjects) - set(label_encoder.classes_))
+            unseen = sorted(set(difficulty_labels) - set(label_encoder.classes_))
             if unseen:
-                print(f"[warn] {len(unseen)} unseen subject(s) in this split; falling back to topic {fallback_id}")
-            topics = np.array([mapping.get(s, fallback_id) for s in subjects], dtype=np.int64)
+                print(f"[warn] {len(unseen)} unseen difficulty bin(s) in this split; falling back to bin {fallback_id}")
+            topics = np.array([mapping.get(s, fallback_id) for s in difficulty_labels], dtype=np.int64)
 
-    unique_subjects = len(np.unique(subjects))
+    unique_bins = len(np.unique(difficulty_labels))
 
     print("Data preparation:")
     print(f"  Samples: {len(logits)}")
-    print(f"  Unique subjects: {unique_subjects}")
+    print(f"  Difficulty bins: {unique_bins}")
     print(f"  Logits shape: {logits.shape}")
 
-    return logits, labels, topics, unique_subjects, label_encoder, question_ids
+    return logits, labels, topics, unique_bins, label_encoder, question_ids
 
 def evaluate_performance(logits, labels, topics, calibrator):
     """Evaluate calibration performance with NCE"""
@@ -383,18 +417,19 @@ def run_calibration_cv(logits, labels, topics, n_topics, device='cpu', n_folds=5
 
     return cv_results
 
-def run_mmlu_experiment():
+def run_mmlu_experiment(model_name=DEFAULT_MODEL_NAME, reference_report_prefix=None):
     """Run the complete MMLU calibration experiment"""
     # device = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = 'cpu'
     print(f"Using device: {device}")
+    print(f"Using model: {model_name}")
     
     # Load MMLU data
     print("\n" + "="*60)
     print("LOADING MMLU DATA")
     print("="*60)
     
-    test_df, validation_df = load_mmlu_data()
+    test_df, validation_df = load_mmlu_data(model_name)
     if test_df is None or validation_df is None:
         return
     
@@ -457,6 +492,10 @@ def run_mmlu_experiment():
             )
         _, _, linear_nce = evaluate_performance(train_logits, train_labels, train_topics, linear_calibrator)
         if not shared_a and not shared_b:
+            report_path = None
+            if reference_report_prefix:
+                safe_conf = config_name.replace(', ', '_').replace(' ', '_')
+                report_path = f"{reference_report_prefix}_{safe_conf}_linear.csv"
             compare_per_topic_reference(
                 linear_calibrator,
                 train_logits,
@@ -466,6 +505,7 @@ def run_mmlu_experiment():
                 shift_then_scale=False,
                 fallback_steps=linear_config.fallback_adam_steps,
                 verbose=True,
+                save_path=report_path,
             )
 
         # Shift-scale calibration
@@ -497,6 +537,10 @@ def run_mmlu_experiment():
             )
         _, _, shift_nce = evaluate_performance(train_logits, train_labels, train_topics, shift_calibrator)
         if not shared_a and not shared_b:
+            report_path = None
+            if reference_report_prefix:
+                safe_conf = config_name.replace(', ', '_').replace(' ', '_')
+                report_path = f"{reference_report_prefix}_{safe_conf}_shift.csv"
             compare_per_topic_reference(
                 shift_calibrator,
                 train_logits,
@@ -506,6 +550,7 @@ def run_mmlu_experiment():
                 shift_then_scale=True,
                 fallback_steps=shift_config.fallback_adam_steps,
                 verbose=True,
+                save_path=report_path,
             )
         
         full_train_results.append({
@@ -624,7 +669,7 @@ def zero_scale_analysis(calibrator, logits, topics, labels, label_encoder, calib
     return zero_ce, warnings
 
 
-def fit_topic_reference(logits, labels, shift_then_scale, fallback_steps):
+def fit_topic_reference_logits(logits, labels, shift_then_scale, fallback_steps):
     n_classes = logits.shape[1]
     cfg = CalibrationConfig(
         shift_then_scale=shift_then_scale,
@@ -640,10 +685,7 @@ def fit_topic_reference(logits, labels, shift_then_scale, fallback_steps):
     calib = TorchCalibrator(cfg, 1, n_classes)
     topics_zero = np.zeros(len(labels), dtype=np.int64)
     calib.fit(logits, labels, topics_zero, verbose=False)
-    with torch.no_grad():
-        a_val = torch.exp(calib.loga.detach()).cpu().numpy()[0]
-        b_val = calib.b.detach().cpu().numpy()[0]
-    return a_val, b_val
+    return calib.predict_logits(logits, topics_zero)
 
 
 def compare_per_topic_reference(calibrator, logits, labels, topics, label_encoder, shift_then_scale,
@@ -651,35 +693,36 @@ def compare_per_topic_reference(calibrator, logits, labels, topics, label_encode
     if calibrator.config.share_a or calibrator.config.share_b:
         return None
 
-    with torch.no_grad():
-        global_a = torch.exp(calibrator.loga.detach()).cpu().numpy()
-        global_b = calibrator.b.detach().cpu().numpy()
-
     records = []
     unique_topics = np.unique(topics)
     for topic_id in np.sort(unique_topics):
         mask = (topics == topic_id)
         if mask.sum() == 0:
             continue
-        ref_a, ref_b = fit_topic_reference(logits[mask], labels[mask], shift_then_scale, fallback_steps)
-        da = float(ref_a - global_a[topic_id])
-        db = ref_b - global_b[topic_id]
-        subject = None
+        ref_logits = fit_topic_reference_logits(logits[mask], labels[mask], shift_then_scale, fallback_steps)
+        ref_ce = cross_entropy_from_logits_np(ref_logits, labels[mask])
+        ref_acc = float((np.argmax(ref_logits, axis=1) == labels[mask]).mean())
+
+        global_logits_topic = calibrator.predict_logits(logits[mask], topics[mask])
+        global_ce = cross_entropy_from_logits_np(global_logits_topic, labels[mask])
+        global_acc = float((np.argmax(global_logits_topic, axis=1) == labels[mask]).mean())
+
+        group_label = None
         if label_encoder is not None and 0 <= topic_id < len(label_encoder.classes_):
             try:
-                subject = label_encoder.inverse_transform([topic_id])[0]
+                group_label = label_encoder.inverse_transform([topic_id])[0]
             except Exception:
-                subject = None
+                group_label = None
         records.append({
             'topic_id': int(topic_id),
-            'subject': subject,
-            'delta_a': da,
-            'max_abs_delta_b': float(np.max(np.abs(db))),
-            'ref_a': float(ref_a),
-            'global_a': float(global_a[topic_id]),
-            'ref_b': ref_b.copy(),
-            'global_b': global_b[topic_id].copy(),
-            'delta_b_vec': db,
+            'group': group_label,
+            'n_examples': int(mask.sum()),
+            'ce_global': global_ce,
+            'ce_reference': ref_ce,
+            'ce_gap': global_ce - ref_ce,
+            'acc_global': global_acc,
+            'acc_reference': ref_acc,
+            'acc_gap': global_acc - ref_acc,
         })
 
     if not records:
@@ -688,28 +731,24 @@ def compare_per_topic_reference(calibrator, logits, labels, topics, label_encode
     df = pd.DataFrame(records)
     if save_path is not None:
         detail_df = df.copy()
-        detail_df['delta_b_vec'] = detail_df['delta_b_vec'].apply(lambda x: np.array2string(x, precision=6))
         detail_df.to_csv(save_path, index=False)
 
     if verbose:
-        max_da = df['delta_a'].abs().max()
-        max_db = df['max_abs_delta_b'].max()
-        mean_da = df['delta_a'].abs().mean()
-        mean_db = df['max_abs_delta_b'].mean()
+        max_gap = df['ce_gap'].abs().max()
+        mean_gap = df['ce_gap'].abs().mean()
         print(
-            f"    per-topic reference check: max|Δa|={max_da:.3e}, max|Δb|={max_db:.3e}, "
-            f"mean|Δa|={mean_da:.3e}, mean|Δb|={mean_db:.3e}"
+            f"    per-topic reference check: max|ΔCE|={max_gap:.3e}, mean|ΔCE|={mean_gap:.3e}"
         )
-        issues = df[(df['delta_a'].abs() > tol) | (df['max_abs_delta_b'] > tol)]
+        issues = df[df['ce_gap'].abs() > tol]
         if issues.empty:
-            print(f"      all topics within tolerance tol={tol:.1e}")
+            print(f"      all topics within tolerance tol={tol:.1e} (ΔCE)")
         else:
-            summary = issues[['topic_id', 'subject', 'delta_a', 'max_abs_delta_b']].copy()
-            summary['subject'] = summary['subject'].fillna('<unknown>')
-            summary['delta_a'] = summary['delta_a'].apply(lambda x: f"{x:+.3e}")
-            summary['max_abs_delta_b'] = summary['max_abs_delta_b'].apply(lambda x: f"{x:.3e}")
+            summary = issues[['topic_id', 'group', 'ce_global', 'ce_reference', 'ce_gap', 'acc_global', 'acc_reference', 'acc_gap']].copy()
+            summary['group'] = summary['group'].fillna('<unknown>')
+            summary['ce_gap'] = summary['ce_gap'].apply(lambda x: f"{x:+.3e}")
+            summary['acc_gap'] = summary['acc_gap'].apply(lambda x: f"{x:+.3e}")
             print("      topics exceeding tolerance:")
-            print(summary.to_string(index=False))
+            print(summary.to_string(index=False, float_format=lambda v: f"{v:.4f}" if isinstance(v, float) else str(v)))
     return df
 
 def train_calibrator(train_logits, train_labels, train_topics, n_topics, device,
@@ -725,15 +764,18 @@ def train_calibrator(train_logits, train_labels, train_topics, n_topics, device,
 
 def per_topic_breakdown(test_df, label_encoder, uncal_logits, uncal_labels,
                         trained_calibs, formula_name):
-    subjects = list(label_encoder.classes_)
+    groups = list(label_encoder.classes_)
+    if 'difficulty_level' not in test_df.columns:
+        raise ValueError("Expected 'difficulty_level' column for per-topic breakdown")
+    difficulty_series = test_df['difficulty_level'].values
     rows = []
-    for subj in subjects:
-        mask = (test_df['subject'].values == subj)
+    for group in groups:
+        mask = (difficulty_series == group)
         if not mask.any(): 
             continue
         logits_s = uncal_logits[mask]
         labels_s = uncal_labels[mask]
-        topic_id = label_encoder.transform([subj])[0]
+        topic_id = label_encoder.transform([group])[0]
         topics_s = np.full(len(labels_s), topic_id, dtype=np.int64)
 
         scores = {'Uncalibrated': nce_from_logits_np(logits_s, labels_s)}
@@ -741,8 +783,8 @@ def per_topic_breakdown(test_df, label_encoder, uncal_logits, uncal_labels,
             cal_logits = calib.predict_logits(logits_s, topics_s)
             scores[name] = nce_from_logits_np(cal_logits, labels_s)
 
-        rows.append({'subject': subj, **scores})
-    df = pd.DataFrame(rows).sort_values('subject').reset_index(drop=True)
+        rows.append({'group': group, **scores})
+    df = pd.DataFrame(rows).sort_values('group').reset_index(drop=True)
     df.attrs['formula'] = formula_name
     return df
 
@@ -753,12 +795,13 @@ def plot_topic_bars(df, title, outfile):
     for i, g in enumerate(groups):
         ax.bar(x + (i-1.5)*width, df[g].values, width, label=g)
     ax.set_title(title)
-    ax.set_xticks(x); ax.set_xticklabels(df['subject'].values, rotation=90)
+    label_col = 'group' if 'group' in df.columns else 'subject'
+    ax.set_xticks(x); ax.set_xticklabels(df[label_col].values, rotation=90)
     ax.set_ylabel('NCE (lower is better)')
     ax.legend(); fig.tight_layout()
     plt.savefig(outfile, dpi=180); plt.close(fig)
 
-def run_topic_breakdown(model_name="meta_llama_Llama_3.2_3B_Instruct"):
+def run_topic_breakdown(model_name=DEFAULT_MODEL_NAME):
     # device = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = 'cpu'
     test_df, validation_df = load_mmlu_data(model_name)
@@ -793,14 +836,37 @@ def run_topic_breakdown(model_name="meta_llama_Llama_3.2_3B_Instruct"):
     df_shift.to_csv('nce_by_topic_shift.csv', index=False)
 
     # Print a quick summary focused on your hypothesis
-    focus = df_shift[['subject', 'Uncalibrated', 'Global', 'GlobalB_TopicA', 'FullTopic']]
-    print("\na*(score+b): per-topic NCE (lower is better)")
+    focus = df_shift[['group', 'Uncalibrated', 'Global', 'GlobalB_TopicA', 'FullTopic']]
+    print("\na*(score+b): per-difficulty NCE (lower is better)")
     print(focus.to_string(index=False, float_format='%.4f'))
 
     return df_linear, df_shift
 
 
 if __name__ == "__main__":
-    train_results, cv_results, test_results = run_mmlu_experiment()
-    # Per-topic figures + table:
-    _df_lin, _df_shift = run_topic_breakdown()
+    parser = argparse.ArgumentParser(description="Run MMLU calibration experiments")
+    parser.add_argument(
+        "--model-name",
+        default=None,
+        help="Name of the model used to generate MMLU logits (defaults to env MMLU_MODEL_NAME or meta_llama_Llama_3.2_3B_Instruct)",
+    )
+    parser.add_argument(
+        "--skip-topic-breakdown",
+        action="store_true",
+        help="Skip per-topic breakdown plots and tables",
+    )
+    parser.add_argument(
+        "--reference-report-prefix",
+        default=None,
+        help="If set, write per-topic reference comparison CSVs with this prefix",
+    )
+    args = parser.parse_args()
+
+    model_name = args.model_name or os.environ.get("MMLU_MODEL_NAME") or DEFAULT_MODEL_NAME
+
+    train_results, cv_results, test_results = run_mmlu_experiment(
+        model_name=model_name,
+        reference_report_prefix=args.reference_report_prefix,
+    )
+    if not args.skip_topic_breakdown:
+        run_topic_breakdown(model_name=model_name)

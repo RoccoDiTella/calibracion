@@ -1,6 +1,9 @@
 import os
+from typing import Dict, List, Optional
+
 import torch
 import numpy as np
+from torch.utils.hooks import RemovableHandle
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from huggingface_hub import login
 from dotenv import load_dotenv
@@ -38,6 +41,161 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 
 print(f"Model loaded! Device map: {model.hf_device_map}")
+
+
+def _resolve_module_from_path(root: torch.nn.Module, path: str) -> torch.nn.Module:
+    """Resolve a dotted path (allowing integer indices) into a module reference."""
+    module = root
+    if not path:
+        raise ValueError("Empty module path provided for probe registration")
+
+    for segment in path.split('.'):
+        if segment == "":
+            raise ValueError(f"Invalid segment in module path '{path}'")
+
+        if segment.isdigit():
+            try:
+                module = module[int(segment)]
+            except (TypeError, IndexError) as exc:
+                raise AttributeError(
+                    f"Module '{module.__class__.__name__}' does not support integer access at segment '{segment}' (path '{path}')"
+                ) from exc
+        else:
+            if not hasattr(module, segment):
+                raise AttributeError(f"Module '{module.__class__.__name__}' has no attribute '{segment}' (while resolving '{path}')")
+            module = getattr(module, segment)
+
+    if not isinstance(module, torch.nn.Module):
+        raise TypeError(f"Resolved object for path '{path}' is not a torch.nn.Module")
+
+    return module
+
+
+def _to_storage_dtype(tensor: torch.Tensor, dtype_str: str) -> torch.Tensor:
+    """Convert tensor to the requested storage dtype on CPU."""
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+
+    target_dtype = dtype_map.get(dtype_str.lower())
+    if target_dtype is None:
+        raise ValueError(f"Unsupported probe storage dtype '{dtype_str}'. Supported values: {list(dtype_map)}")
+
+    return tensor.to(device="cpu", dtype=target_dtype)
+
+
+class ActivationProbeManager:
+    """Register forward hooks to capture intermediate activations for analysis."""
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        layer_paths: Optional[List[str]] = None,
+        storage_dtype: str = "float32",
+        capture_all_forwards: bool = False,
+    ) -> None:
+        self.model = model
+        self.layer_paths = layer_paths or []
+        self.storage_dtype = storage_dtype
+        self.capture_all_forwards = capture_all_forwards
+
+        self.enabled = bool(self.layer_paths)
+        self._recording = False
+        self._current_key: Optional[str] = None
+        self._handles: List[RemovableHandle] = []
+        self._records: Dict[str, Dict[str, List[torch.Tensor]]] = {}
+        self._memory_bytes: Dict[str, int] = {}
+
+        if self.enabled:
+            self._register_hooks()
+
+    def _register_hooks(self) -> None:
+        for path in self.layer_paths:
+            module = _resolve_module_from_path(self.model, path)
+            handle = module.register_forward_hook(self._make_hook(path))
+            self._handles.append(handle)
+            print(f"[probe] Registered hook on module: {path}")
+
+    def _make_hook(self, layer_path: str):
+        def hook(_: torch.nn.Module, __, output):
+            if not self._recording or self._current_key is None:
+                return
+
+            tensor = self._extract_tensor(output)
+            if tensor is None:
+                return
+
+            stored_tensor = _to_storage_dtype(tensor, self.storage_dtype)
+
+            layer_records = self._records.setdefault(self._current_key, {}).setdefault(layer_path, [])
+            layer_records.append(stored_tensor)
+
+            bytes_used = stored_tensor.element_size() * stored_tensor.nelement()
+            self._memory_bytes[self._current_key] = self._memory_bytes.get(self._current_key, 0) + bytes_used
+
+        return hook
+
+    def _extract_tensor(self, output) -> Optional[torch.Tensor]:
+        if isinstance(output, torch.Tensor):
+            return output.detach()
+        if isinstance(output, (tuple, list)) and output:
+            first = output[0]
+            if isinstance(first, torch.Tensor):
+                return first.detach()
+        return None
+
+    def start_recording(self, key: str) -> None:
+        if not self.enabled:
+            return
+        self._current_key = key
+        self._recording = True
+        # Reset records for this key to avoid mixing runs
+        self._records[key] = {}
+        self._memory_bytes[key] = 0
+
+    def stop_recording(self) -> None:
+        self._recording = False
+        self._current_key = None
+
+    def should_record(self, explicit_request: bool) -> bool:
+        return self.enabled and (self.capture_all_forwards or explicit_request)
+
+    def has_recordings(self, key: str) -> bool:
+        return key in self._records and any(self._records[key].values())
+
+    def get_recordings(self, key: str) -> Optional[Dict[str, List[torch.Tensor]]]:
+        if not self.enabled:
+            return None
+        return self._records.get(key)
+
+    def get_memory_usage(self, key: Optional[str] = None) -> Dict[str, int]:
+        if key is not None:
+            return {key: self._memory_bytes.get(key, 0)}
+        return dict(self._memory_bytes)
+
+    def clear_recordings(self) -> None:
+        self._records.clear()
+        self._memory_bytes.clear()
+
+    def remove_hooks(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+
+
+probe_layer_spec = os.getenv("PROBE_LAYER_PATHS", "")
+probe_layers = [segment.strip() for segment in probe_layer_spec.split(',') if segment.strip()]
+probe_storage_dtype = os.getenv("PROBE_STORAGE_DTYPE", "float32")
+probe_capture_all = os.getenv("PROBE_CAPTURE_ALL", "0") == "1"
+
+probe_manager = ActivationProbeManager(
+    model=model,
+    layer_paths=probe_layers,
+    storage_dtype=probe_storage_dtype,
+    capture_all_forwards=probe_capture_all,
+)
 
 # Get token IDs for answer options
 letters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K']
@@ -102,35 +260,60 @@ def hash_string(s: str) -> str:
     """Hash a string for cache keys"""
     return hashlib.sha256(s.encode('utf-8')).hexdigest()
 
-def forward(prompt, nopts=4):
+def forward(prompt, nopts=4, *, return_activations: bool = False, probe_id: Optional[str] = None):
     """
     Compute raw logits for the answer tokens without any masking.
-    Returns logits for the first nopts letters (A, B, C, D, etc.)
+
+    When ``return_activations`` is True and probe layers are configured, this function
+    also returns the captured activations for the requested layers.
     """
     key = hash_string(prompt)
-    if key in cache:
+    sample_key = probe_id or key
+    cache_hit = key in cache
+    need_fresh_activations = (
+        return_activations
+        and probe_manager.enabled
+        and not probe_manager.has_recordings(sample_key)
+    )
+
+    if cache_hit and not need_fresh_activations:
+        if return_activations:
+            activations = probe_manager.get_recordings(sample_key) if probe_manager.enabled else None
+            return cache[key], activations
         return cache[key]
-    
+
     # Tokenize input
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    
+
+    record_activations = probe_manager.should_record(return_activations)
+    if record_activations:
+        probe_manager.start_recording(sample_key)
+
     # Forward pass to get logits
-    with torch.no_grad():
-        outputs = model(**inputs)
-        # Get logits for the last token position
-        last_token_logits = outputs.logits[0, -1, :]
-        
-        # Extract logits for the letter tokens
-        scores = last_token_logits[letter_ids[:nopts]]
-    
+    try:
+        with torch.no_grad():
+            outputs = model(**inputs)
+            # Get logits for the last token position
+            last_token_logits = outputs.logits[0, -1, :]
+
+            # Extract logits for the letter tokens
+            scores = last_token_logits[letter_ids[:nopts]]
+    finally:
+        if record_activations:
+            probe_manager.stop_recording()
+
     # Cache the result
     cache[key] = scores
-    
+
     # Save cache periodically (every 20 new entries)
     if len(cache) % 20 == 0:
         save_cache_safely(cache, cache_filename)
         # print(f"Cache saved ({len(cache)} entries)")
-    
+
+    if return_activations:
+        activations = probe_manager.get_recordings(sample_key) if probe_manager.enabled else None
+        return scores, activations
+
     return scores
 
 def write_prompt(question, options, sep=')'):
